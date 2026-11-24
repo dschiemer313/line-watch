@@ -226,7 +226,7 @@ function renderSettings() {
   </div>
   <div class="card note">
     <b style="color:var(--text)">How it works</b><br>
-    Your Cloudflare watcher checks every minute while a watched game is live (every 15 min before that). When the team's spread reaches your target or better, it pushes an alert with the score, the injury report, and a warning if the line moved more than the score explains. It never places bets.
+    Your Cloudflare watcher checks about every 8 seconds from 30 min before tip until the final (every 15 min before that). When the team's spread reaches your target or better, it pushes an alert with the score, the injury report, and a warning if the line moved more than the score explains. It never places bets.
   </div>`;
 }
 

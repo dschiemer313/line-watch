@@ -17,7 +17,9 @@ const LEAGUES = {
   ncaaf: { path: 'football/college-football', label: 'NCAAF', groups: '80' },
 };
 
-const PREGAME_LEAD_MIN = 30;      // check every minute from 30 min before start
+const FAST_EVERY_SEC = 8;         // during games, re-check this often inside each 1-minute cron run
+const FAST_WINDOW_SEC = 50;       // stop before the next cron run starts
+const PREGAME_LEAD_MIN = 30;      // fast checks from 30 min before start
 const PREGAME_EVERY_MIN = 15;     // before that, check every 15 min (catches injury-news moves)
 const REARM_GAP = 1.5;            // "alert again" re-arms once the line falls this far back past the target
 const MAX_HISTORY = 240;
@@ -54,8 +56,10 @@ const coreOddsUrl = (league, id) => {
   return `https://sports.core.api.espn.com/v2/sports/${sport}/leagues/${lg}/events/${id}/competitions/${id}/odds`;
 };
 
-async function getJSON(url) {
-  const r = await fetch(url, { headers: { 'user-agent': 'line-watch/1.0' }, cf: { cacheTtl: 15 } });
+async function getJSON(url, fresh = false) {
+  // fresh: add a throwaway param so neither Cloudflare nor ESPN's CDN hands back an older copy
+  if (fresh) url += (url.includes('?') ? '&' : '?') + '_=' + Math.floor(Date.now() / 4000);
+  const r = await fetch(url, { headers: { 'user-agent': 'line-watch/1.0' }, cache: 'no-store' });
   if (!r.ok) throw new Error(`${r.status} ${url}`);
   return r.json();
 }
@@ -96,8 +100,8 @@ export function simplifyEvent(e) {
   };
 }
 
-async function fetchGames(league, date) {
-  const d = await getJSON(scoreboardUrl(league, date));
+async function fetchGames(league, date, fresh = false) {
+  const d = await getJSON(scoreboardUrl(league, date), fresh);
   return (d.events || []).map(simplifyEvent);
 }
 
@@ -192,27 +196,26 @@ const loadWatches = async env => (await env.WATCH.get('watches', 'json')) || [];
 const saveWatches = (env, list) => env.WATCH.put('watches', JSON.stringify(list));
 
 // ---------- the minute-by-minute check ----------
-export async function runCheck(env, { force = false } = {}) {
+// memo: changes made earlier in this same cron run (KV can be a moment behind its own writes,
+// and we must never send the same alert twice). pass: 0 for the first check of the minute.
+export async function runCheck(env, { force = false, memo = new Map(), pass = 0 } = {}) {
   const log = [];
-  const watches = await loadWatches(env);
+  const watches = (await loadWatches(env)).map(w => memo.has(w.id) ? { ...w, ...memo.get(w.id) } : w);
   const active = watches.filter(w => w.status !== 'done');
-  if (!active.length) return { log: ['no active watches'], changed: 0 };
+  if (!active.length) return { log: ['no active watches'], changed: 0, fast: false };
 
   const t = now();
   const minute = Math.floor(t / 60000);
-  const due = active.filter(w => {
-    const start = Date.parse(w.start);
-    if (force) return true;
-    if (t >= start - PREGAME_LEAD_MIN * 60000) return true;
-    return minute % PREGAME_EVERY_MIN === 0;
-  });
-  if (!due.length) return { log: ['nothing due this minute'], changed: 0 };
+  const isFast = w => t >= Date.parse(w.start) - PREGAME_LEAD_MIN * 60000;
+  const due = active.filter(w => force || isFast(w) || (pass === 0 && minute % PREGAME_EVERY_MIN === 0));
+  const fast = active.some(isFast);
+  if (!due.length) return { log: ['nothing due this minute'], changed: 0, fast };
 
   // One scoreboard call per league+date covers every watched game in it.
   const boards = {};
   for (const w of due) {
     const k = w.league + '|' + w.date;
-    if (!boards[k]) boards[k] = fetchGames(w.league, w.date).catch(e => { log.push('scoreboard error ' + e.message); return []; });
+    if (!boards[k]) boards[k] = fetchGames(w.league, w.date, true).catch(e => { log.push('scoreboard error ' + e.message); return []; });
   }
 
   const updates = new Map();
@@ -228,9 +231,11 @@ export async function runCheck(env, { force = false } = {}) {
     const isHome = g.home.id === w.teamId;
     let line = g.odds ? (isHome ? g.odds.home.cur : g.odds.away.cur) : null;
     let provider = g.odds?.provider || null;
-    if (g.state === 'in') {
+    // The scoreboard (refreshed every ~7s) is the main source. Once a minute, see whether ESPN also
+    // lists a dedicated live-odds provider; use it only if it exists (that feed is cached longer).
+    if (g.state === 'in' && pass === 0) {
       const live = await liveLineFromCore(w.league, w.eventId, isHome);
-      if (live) { line = live.line; provider = live.provider; }
+      if (live && /live/i.test(live.provider)) { line = live.line; provider = live.provider; }
     }
     if (line === null) { log.push(`${w.teamAbbr}: no line posted (often pulled during reviews/timeouts)`); continue; }
 
@@ -266,13 +271,29 @@ export async function runCheck(env, { force = false } = {}) {
 
   // Re-read before writing so edits made from the phone during this run aren't lost.
   if (updates.size) {
+    for (const [id, u] of updates) memo.set(id, { ...(memo.get(id) || {}), ...u });
     const fresh = await loadWatches(env);
-    for (const w of fresh) if (updates.has(w.id)) Object.assign(w, updates.get(w.id));
+    for (const w of fresh) if (memo.has(w.id)) Object.assign(w, memo.get(w.id));
     await saveWatches(env, fresh);
   }
   // Heartbeat so the app can show the watcher is alive (≤ 1 write / 15 min to stay inside KV free limits).
-  if (force || minute % 15 === 0) await env.WATCH.put('heartbeat', JSON.stringify({ at: t, log }));
-  return { log, changed: updates.size };
+  if (force || (pass === 0 && minute % 15 === 0)) await env.WATCH.put('heartbeat', JSON.stringify({ at: t, log }));
+  return { log, changed: updates.size, fast };
+}
+
+// Cron fires once a minute; during games keep re-checking every few seconds until just before the next run.
+export async function runMinute(env, sleep = ms => new Promise(r => setTimeout(r, ms))) {
+  const start = now(), memo = new Map();
+  let pass = 0, r;
+  do {
+    r = await runCheck(env, { memo, pass });
+    pass++;
+    if (!r.fast) break;
+    const wait = start + pass * FAST_EVERY_SEC * 1000 - now();
+    if (now() + Math.max(wait, 0) > start + FAST_WINDOW_SEC * 1000) break;
+    if (wait > 0) await sleep(wait);
+  } while (true);
+  return pass;
 }
 
 // ---------- HTTP API for the phone app ----------
@@ -346,6 +367,6 @@ export default {
     }
   },
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runCheck(env).catch(e => console.log('check failed', e.message)));
+    ctx.waitUntil(runMinute(env).catch(e => console.log('check failed', e.message)));
   },
 };

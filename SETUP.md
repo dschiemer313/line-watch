@@ -43,7 +43,7 @@ You'll make up two private values along the way. Keep them in your Notes app, no
 
 ## Using it
 - **Games** tab: pick a league and day, tap a game, tap the team you'd bet on, and set the target, e.g. Celtics **-2**. That means: alert when they're favored by 2 or less.
-- The watcher checks every 15 min before the game (catching injury-news moves) and **every minute** from 30 min before tip until the final, then closes the watch.
+- The watcher checks every 15 min before the game (catching injury-news moves) and **about every 8 seconds** from 30 min before tip until the final, then closes the watch. (Cloudflare starts it once a minute; each run keeps re-checking until the next one.)
 - **Alert again if it bounces back**: after an alert, it re-arms once the line moves 1.5 pts back past your target, so the next run alerts again.
 - Each alert shows the score, the injury report (flagging anyone **new** since you set it), and a ⚠️ when the line moved more than the score explains. Tapping it opens the game in DraftKings.
 

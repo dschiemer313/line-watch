@@ -1,7 +1,7 @@
 // Simulates a live game against the real worker code: real ESPN data for the game shape,
 // then fake scores/lines minute by minute, a fake KV store, and a captured ntfy push.
 // Run: node worker/test.mjs
-import worker, { runCheck, evaluate, parseLine } from './worker.js';
+import worker, { runCheck, runMinute, evaluate, parseLine } from './worker.js';
 import assert from 'node:assert/strict';
 
 const realFetch = globalThis.fetch;
@@ -89,4 +89,22 @@ assert.ok(!ev3.fire && ev3.warnings.length === 1); console.log('Pre-game move ch
 assert.equal(parseLine('PK'), 0); assert.equal(parseLine('+3.5'), 3.5);
 
 console.log(`\nKV writes during simulated game: ${writes}`);
+
+// --- fast loop: one cron minute, line drops partway through, should alert on that pass, once ---
+kv.clear(); pushes.length = 0;
+setGame({ state: 'pre', homeScore: 0, awayScore: 0, homeLine: -10, detail: '7:30 PM' });
+await call('POST', '/api/watches', { league: 'nba', date, eventId: ev.id, teamId: homeC.team.id, target: -2, repeat: false });
+const realNow = Date.now; let clock = realNow(); Date.now = () => clock;
+let fetches = 0;
+const lines = [-6, -5, -4, -2, -1.5, -1, -2, -3];          // what ESPN shows on each successive check
+const prevFetch = globalThis.fetch;
+globalThis.fetch = async (url, opts) => {
+  if (String(url).includes('/scoreboard')) { setGame({ state: 'in', homeScore: 40, awayScore: 49, homeLine: lines[Math.min(fetches++, lines.length - 1)] }); }
+  return prevFetch(url, opts);
+};
+const passes = await runMinute(env, async ms => { clock += ms; });
+Date.now = realNow; globalThis.fetch = prevFetch;
+console.log(`\nFast loop: ${passes} checks in one minute (every ${Math.round(50 / (passes - 1))}s-ish); alert on check #4 of ${fetches}; pushes sent: ${pushes.length}`);
+assert.ok(passes >= 6, 'should check about every 8s');
+assert.equal(pushes.length, 1, 'exactly one alert even though the line stayed at/through target for several checks');
 console.log('\nALL TESTS PASSED');
