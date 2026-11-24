@@ -108,6 +108,11 @@ input[type=text], input[type=password], input[type=url] {
 .seg button { flex: 1; border: 0; background: transparent; padding: 8px 0; border-radius: 8px; font-size: 14px; font-weight: 650; color: var(--text-2); cursor: pointer; }
 .seg button.on { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.12); }
 .explain small { font-size: 12px; color: var(--muted); }
+.stepper.small { margin-top: 8px; }
+.stepper.small button { height: 44px; font-size: 22px; }
+.stepper.small .val { font-size: 26px; }
+.stepper .val small { font-size: 14px; font-weight: 600; color: var(--muted); }
+.sheet .chips { flex-wrap: wrap; }
 
 /* bottom sheet */
 .sheet-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 20; }

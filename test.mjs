@@ -1,7 +1,7 @@
 // Simulates a live game against the real worker code: real ESPN data for the game shape,
 // then fake scores/lines minute by minute, a fake KV store, and a captured ntfy push.
 // Run: node worker/test.mjs
-import worker, { runCheck, runMinute, evaluate, parseLine } from './worker.js';
+import worker, { runCheck, runMinute, evaluate, parseLine, inWindow, cleanUntil, untilLabel } from './worker.js';
 import assert from 'node:assert/strict';
 
 const realFetch = globalThis.fetch;
@@ -136,4 +136,46 @@ comp.odds[0].moneyline.home.close.odds = '+250';
 let r2 = await runCheck(env, { force: true });
 console.log(`\nMoneyline watch: ${r1.log[0]}  →  ${r2.log[0]}`);
 assert.equal(pushes.length, 1); console.log('  alert title:', pushes[0].title);
+// --- "only alert until" cutoffs ---
+const at = (league, until, game) => inWindow({ league, until }, { state: 'in', ...game });
+const q2 = { p: 2, left: 0 }, q2_2min = { p: 2, left: 120 };
+const cases = [
+  ['NBA until end of Q2', 'nba', q2, { period: 2, clockSec: 30 }, true],
+  ['  halftime (Q2 0:00)', 'nba', q2, { period: 2, clockSec: 0 }, true],
+  ['  Q3 11:50', 'nba', q2, { period: 3, clockSec: 710 }, false],
+  ['  overtime', 'nba', q2, { period: 5, clockSec: 200 }, false],
+  ['NBA until Q2 2:00 left, at 3:00', 'nba', q2_2min, { period: 2, clockSec: 180 }, true],
+  ['  at 1:59', 'nba', q2_2min, { period: 2, clockSec: 119 }, false],
+  ['NHL until end of P2, P2 5:00', 'nhl', q2, { period: 2, clockSec: 300 }, true],
+  ['  P3 19:00', 'nhl', q2, { period: 3, clockSec: 1140 }, false],
+  ['NCAAB until end of H1, H1 1:00', 'ncaab', { p: 1, left: 0 }, { period: 1, clockSec: 60 }, true],
+  ['  H2 19:30', 'ncaab', { p: 1, left: 0 }, { period: 2, clockSec: 1170 }, false],
+  ["Soccer until 60', at 59'", 'epl', { min: 60 }, { clock: "59'" }, true],
+  ["  at 61'", 'epl', { min: 60 }, { clock: "61'" }, false],
+  ['MLB until end of bot 5th, Bot 5th 2 outs', 'mlb', { inn: 5, half: 'bot', outs: 3 }, { period: 5, detail: 'Bot 5th', outs: 2 }, true],
+  ['  End 5th', 'mlb', { inn: 5, half: 'bot', outs: 3 }, { period: 5, detail: 'End 5th' }, true],
+  ['  Top 6th 0 outs', 'mlb', { inn: 5, half: 'bot', outs: 3 }, { period: 6, detail: 'Top 6th', outs: 0 }, false],
+  ['MLB until 1 out in top 3rd, Top 3rd 0 outs', 'mlb', { inn: 3, half: 'top', outs: 1 }, { period: 3, detail: 'Top 3rd', outs: 0 }, true],
+  ['  Top 3rd 1 out', 'mlb', { inn: 3, half: 'top', outs: 1 }, { period: 3, detail: 'Top 3rd', outs: 1 }, false],
+];
+console.log('\nCutoff checks:');
+for (const [label, lg, u, gm, want] of cases) {
+  assert.equal(at(lg, u, gm), want, label);
+  console.log(`  ${(label + ' (' + untilLabel(lg, u) + ')').padEnd(70)} → ${want ? 'alert allowed' : 'too late'}`);
+}
+assert.equal(inWindow({ league: 'nba', until: q2 }, { state: 'pre' }), true, 'pre-game always allowed');
+assert.deepEqual(cleanUntil('nba', { p: 9, left: 9999 }), { p: 4, left: 720 }, 'clamped to the sport');
+assert.equal(cleanUntil('nba', null), null);
+
+// Line hits target in Q3 on a "until end of Q2" watch → no alert, watch closes
+kv.clear(); pushes.length = 0;
+setGame({ state: 'pre', homeScore: 0, awayScore: 0, homeLine: -10, detail: '7:30 PM' });
+await call('POST', '/api/watches', { league: 'nba', date, eventId: ev.id, teamId: homeC.team.id, target: -2, until: { p: 2, left: 0 } });
+setGame({ state: 'in', homeScore: 50, awayScore: 52, homeLine: -5 }); comp.status.period = 2; comp.status.clock = 100;
+const c1 = await runCheck(env, { force: true });
+setGame({ state: 'in', homeScore: 55, awayScore: 64, homeLine: -1 }); comp.status.period = 3; comp.status.clock = 600;
+const c2 = await runCheck(env, { force: true });
+console.log(`\nUntil-Q2 watch: ${c1.log[0]}  →  ${c2.log[0]}`);
+assert.equal(pushes.length, 0); assert.equal(JSON.parse(kv.get('watches'))[0].status, 'done');
+
 console.log('\nALL TESTS PASSED');

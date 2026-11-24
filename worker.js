@@ -21,6 +21,68 @@ const LEAGUES = {
   epl:   { path: 'soccer/eng.1', label: 'EPL' },
 };
 
+// Regulation structure, for "only alert until <point in the game>".
+// clock = countdown periods (len in minutes); minute = soccer match minute; baseball = inning/half/outs.
+export const GAME_CLOCK = {
+  nba: { kind: 'clock', periods: 4, len: 12, tag: 'Q' }, wnba: { kind: 'clock', periods: 4, len: 10, tag: 'Q' },
+  ncaab: { kind: 'clock', periods: 2, len: 20, tag: 'H' }, nfl: { kind: 'clock', periods: 4, len: 15, tag: 'Q' },
+  ncaaf: { kind: 'clock', periods: 4, len: 15, tag: 'Q' }, nhl: { kind: 'clock', periods: 3, len: 20, tag: 'P' },
+  mls: { kind: 'minute' }, epl: { kind: 'minute' }, mlb: { kind: 'baseball' },
+};
+const ord = n => n + ([11, 12, 13].includes(n % 100) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'));
+const mmss = s => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
+export function untilLabel(league, u) {
+  if (!u) return 'any time';
+  const c = GAME_CLOCK[league] || {};
+  if (c.kind === 'clock') return u.left ? `${c.tag}${u.p} with ${mmss(u.left)} left` : `end of ${c.tag}${u.p}`;
+  if (c.kind === 'minute') return `${u.min}' (match minute)`;
+  if (c.kind === 'baseball') return u.outs >= 3 ? `end of ${u.half === 'top' ? 'top' : 'bottom'} ${ord(u.inn)}`
+    : u.outs === 0 ? `start of ${u.half === 'top' ? 'top' : 'bottom'} ${ord(u.inn)}` : `${u.outs} out${u.outs === 1 ? '' : 's'} in the ${u.half === 'top' ? 'top' : 'bottom'} ${ord(u.inn)}`;
+  return '?';
+}
+// How far into the game we are, in the same units as cutoffOf(). null = can't tell.
+export function progressOf(league, g) {
+  const c = GAME_CLOCK[league];
+  if (!c || g.state !== 'in') return null;
+  if (c.kind === 'clock') {
+    if (!g.period) return null;
+    if (g.period > c.periods) return Infinity;                       // overtime
+    const left = typeof g.clockSec === 'number' ? g.clockSec : null;
+    return (g.period - 1) * c.len * 60 + (left === null ? 0 : Math.max(0, c.len * 60 - left));
+  }
+  if (c.kind === 'minute') {
+    const m = parseInt(String(g.clock || ''), 10);
+    if (Number.isFinite(m)) return m;
+    return typeof g.clockSec === 'number' ? Math.floor(g.clockSec / 60) : null;
+  }
+  if (c.kind === 'baseball') {
+    const inn = g.period, d = String(g.detail || '');
+    if (!inn) return null;
+    const outs = typeof g.outs === 'number' ? g.outs : 0;
+    if (/^mid/i.test(d)) return (inn - 1) * 6 + 3;
+    if (/^end/i.test(d)) return inn * 6;
+    // + 0.5: a half-inning in progress is past the moment its last out was recorded
+    if (/^bot/i.test(d)) return (inn - 1) * 6 + 3 + outs + 0.5;
+    return (inn - 1) * 6 + outs + 0.5;                                // top of the inning
+  }
+  return null;
+}
+export function cutoffOf(league, u) {
+  const c = GAME_CLOCK[league];
+  if (!c || !u) return Infinity;
+  if (c.kind === 'clock') return (u.p - 1) * c.len * 60 + (c.len * 60 - (u.left || 0));
+  if (c.kind === 'minute') return u.min;
+  if (c.kind === 'baseball') return (u.inn - 1) * 6 + (u.half === 'top' ? 0 : 3) + Math.min(u.outs ?? 3, 3);
+  return Infinity;
+}
+// true = still inside the window (pre-game always counts); false = past the cutoff.
+export function inWindow(w, g) {
+  if (!w.until || g.state === 'pre') return true;
+  const p = progressOf(w.league, g);
+  if (p === null) return true;               // unknown clock: don't block the alert
+  return p <= cutoffOf(w.league, w.until);
+}
+
 // Two kinds of alert: point spread, or moneyline (American odds). "Better" always means a bigger payout
 // for the team you'd bet on. Moneylines compare on a cents scale so -110 → -105 → +100 → +110 is smooth.
 const REARM_GAP_ML = 20;          // moneyline re-arm gap, in cents
@@ -112,7 +174,8 @@ export function simplifyEvent(e) {
   return {
     id: e.id, name: e.name, shortName: e.shortName, start: e.date,
     state: st.type.state, completed: !!st.type.completed, detail: st.type.shortDetail || st.type.detail,
-    period: st.period, clock: st.displayClock, home, away, odds,
+    period: st.period, clock: st.displayClock, clockSec: typeof st.clock === 'number' ? st.clock : null,
+    outs: typeof c.situation?.outs === 'number' ? c.situation.outs : null, home, away, odds,
   };
 }
 
@@ -197,7 +260,7 @@ export function buildAlert(w, g, line, provider, injuries, warnings) {
   } else if (g.state === 'pre') {
     lines.push(`Pre-game · ${g.detail || ''} vs ${opp.abbr}`);
   }
-  lines.push(`Your target: ${fmtVal(w.target, m)}${ml} or better · ${provider || 'DraftKings'} via ESPN`);
+  lines.push(`Your target: ${fmtVal(w.target, m)}${ml} or better${w.until ? ` (until ${untilLabel(w.league, w.until)})` : ''} · ${provider || 'DraftKings'} via ESPN`);
   for (const x of warnings) lines.push('⚠️ ' + x);
   if (injuries) {
     const baseline = new Set((w.injuryBaseline || []).map(i => i.name));
@@ -258,6 +321,10 @@ export async function runCheck(env, { force = false, memo = new Map(), pass = 0 
     if (g.state === 'post' || g.completed) {
       u.status = 'done'; u.final = `${g.away.abbr} ${g.away.score} - ${g.home.abbr} ${g.home.score}`;
       updates.set(w.id, u); log.push(`${w.teamAbbr}: final, watch closed`); continue;
+    }
+    if (!inWindow(w, g)) {
+      u.status = 'done'; u.final = `Window closed: past ${untilLabel(w.league, w.until)}`;
+      updates.set(w.id, u); log.push(`${w.teamAbbr}: past ${untilLabel(w.league, w.until)}, watch closed`); continue;
     }
     const isHome = g.home.id === w.teamId;
     const m = w.market || 'spread';
@@ -328,10 +395,22 @@ export async function runMinute(env, sleep = ms => new Promise(r => setTimeout(r
 }
 
 // ---------- HTTP API for the phone app ----------
+// Accept only a well-formed cutoff for the league's clock type; anything else means "any time".
+export function cleanUntil(league, u) {
+  const c = GAME_CLOCK[league];
+  if (!u || !c) return null;
+  const int = (v, lo, hi) => { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : null; };
+  if (c.kind === 'clock') { const p = int(u.p, 1, c.periods), left = int(u.left ?? 0, 0, c.len * 60); return p ? { p, left } : null; }
+  if (c.kind === 'minute') { const min = int(u.min, 1, 120); return min ? { min } : null; }
+  if (c.kind === 'baseball') { const inn = int(u.inn, 1, 9); return inn ? { inn, half: u.half === 'top' ? 'top' : 'bot', outs: int(u.outs ?? 3, 0, 3) } : null; }
+  return null;
+}
+
 async function createWatch(env, body) {
   const { league, eventId, teamId, target, repeat = false, date } = body;
   const market = body.market === 'ml' ? 'ml' : 'spread';
   if (!LEAGUES[league]) throw new Error('unknown league');
+  const until = cleanUntil(league, body.until);
   if (typeof target !== 'number' || !Number.isFinite(target)) throw new Error('target must be a number');
   const games = await fetchGames(league, date);
   const g = games.find(x => x.id === String(eventId));
@@ -344,7 +423,7 @@ async function createWatch(env, body) {
   const injuries = await fetchInjuries(league, g.id, me.id);
   const w = {
     id: crypto.randomUUID().slice(0, 8), league, date, eventId: g.id, start: g.start,
-    teamId: me.id, teamAbbr: me.abbr, teamName: me.name, oppAbbr: opp.abbr, isHome, market,
+    teamId: me.id, teamAbbr: me.abbr, teamName: me.name, oppAbbr: opp.abbr, isHome, market, until,
     target, repeat: !!repeat, status: 'armed', created: now(),
     openLine: open ?? cur, baseLine: cur, pregameLine: g.state === 'pre' ? cur : (open ?? cur), lastLine: cur, lastLineAt: now(), provider: g.odds?.provider || null,
     history: cur === null ? [] : [[now(), cur, me.score, opp.score, g.state === 'in' ? g.detail : g.state]],
@@ -380,6 +459,7 @@ export default {
         if (!w) return json({ error: 'not found' }, 404);
         if (typeof body.target === 'number') w.target = body.target;
         if (typeof body.repeat === 'boolean') w.repeat = body.repeat;
+        if ('until' in body) w.until = cleanUntil(w.league, body.until);
         if (body.status === 'armed') w.status = 'armed';
         await saveWatches(env, list);
         return json(w);
