@@ -210,11 +210,11 @@ function renderSettings() {
     <b>Connect your watcher</b>
     <div class="note">Paste the two values from your Cloudflare setup (SETUP.md, steps 3–4). They're saved only on this phone.</div>
     <label class="f" for="cfg-url">Worker URL</label>
-    <input type="url" id="cfg-url" placeholder="https://line-watch.yourname.workers.dev" value="${esc(S.cfg.url)}" autocapitalize="off" autocorrect="off">
+    <input type="url" id="cfg-url" placeholder="https://line-watch.yourname.workers.dev" value="${esc(S.cfg.url)}" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false">
     <label class="f" for="cfg-key">App key</label>
-    <input type="password" id="cfg-key" placeholder="the APP_KEY you set" value="${esc(S.cfg.key)}" autocapitalize="off" autocorrect="off">
+    <input type="text" id="cfg-key" placeholder="the APP_KEY you set" value="${esc(S.cfg.key)}" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false">
     <button class="btn" id="cfg-save">Save</button>
-    <div id="cfg-status" class="note" style="margin-top:8px">${configured() ? (S.watchErr ? `<span class="bad">${esc(S.watchErr)}</span>` : '<span class="ok">Connected ✓</span>') : ''}</div>
+    <div id="cfg-status" class="note" style="margin-top:8px">${configured() ? (S.watchErr ? `<span class="bad">${esc(S.watchErr)}</span>` : '<span class="ok">Connected ✓</span>') : '<span class="bad">Not connected yet. Fill in both boxes and tap Save.</span>'}</div>
     ${hb}
   </div>
   <div class="card">
@@ -328,9 +328,17 @@ document.addEventListener('click', async e => {
     return;
   }
   if (t.id === 'cfg-save') {
-    S.cfg.url = $('#cfg-url').value.trim(); S.cfg.key = $('#cfg-key').value.trim();
-    store.set('url', S.cfg.url); store.set('key', S.cfg.key);
-    await loadWatches(); toast(S.watchErr ? 'Saved, but: ' + S.watchErr : 'Connected ✓');
+    let url = $('#cfg-url').value.trim(), key = $('#cfg-key').value.trim();
+    if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+    const status = $('#cfg-status');
+    if (!url || !key) { status.innerHTML = `<span class="bad">${!url ? 'Worker URL is empty.' : 'App key is empty.'} Fill in both boxes, then Save.</span>`; return; }
+    S.cfg.url = url; S.cfg.key = key;
+    store.set('url', url); store.set('key', key);
+    const persisted = store.get('url', '') === url && store.get('key', '') === key;
+    status.textContent = 'Checking…';
+    S.watchErr = null; await loadWatches();
+    if (S.watchErr) toast('Could not connect: ' + S.watchErr, 5000);
+    else toast(persisted ? 'Connected ✓' : 'Connected, but this browser won\'t remember it (Private mode?)', 5000);
     return;
   }
   if (t.id === 'test-btn') { try { await api('/api/test', { method: 'POST' }); toast('Test alert sent. Check your phone.'); } catch (err) { toast('Failed: ' + err.message, 4000); } return; }
