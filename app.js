@@ -2,13 +2,23 @@
 // stored in your Cloudflare Worker (which does the minute-by-minute checking and sends alerts).
 'use strict';
 
+// market: what the Games list shows by default (hockey/baseball/soccer spreads barely move; moneylines do).
 const LEAGUES = {
-  nba:   { path: 'basketball/nba', label: 'NBA' },
-  ncaab: { path: 'basketball/mens-college-basketball', label: 'NCAAB', groups: '50' },
-  nfl:   { path: 'football/nfl', label: 'NFL' },
-  ncaaf: { path: 'football/college-football', label: 'NCAAF', groups: '80' },
-  wnba:  { path: 'basketball/wnba', label: 'WNBA' },
+  nba:   { path: 'basketball/nba', label: 'NBA', market: 'spread' },
+  nhl:   { path: 'hockey/nhl', label: 'NHL', market: 'ml' },
+  nfl:   { path: 'football/nfl', label: 'NFL', market: 'spread' },
+  ncaab: { path: 'basketball/mens-college-basketball', label: 'NCAAB', groups: '50', market: 'spread' },
+  ncaaf: { path: 'football/college-football', label: 'NCAAF', groups: '80', market: 'spread' },
+  mlb:   { path: 'baseball/mlb', label: 'MLB', market: 'ml' },
+  wnba:  { path: 'basketball/wnba', label: 'WNBA', market: 'spread' },
+  mls:   { path: 'soccer/usa.1', label: 'MLS', market: 'ml' },
+  epl:   { path: 'soccer/eng.1', label: 'EPL', market: 'ml' },
 };
+// Moneylines on a smooth "cents" scale: -120 → -20, ±100 → 0, +150 → 50 (bigger = better payout).
+const scale = (x, m) => m === 'ml' ? (x >= 100 ? x - 100 : x <= -100 ? x + 100 : 0) : x;
+const unscale = (s, m) => m === 'ml' ? (s >= 0 ? s + 100 : s - 100) : s;
+const fmtVal = (x, m) => m !== 'ml' ? fmtLine(x) : (x === null || x === undefined) ? '—' : (x > 0 ? '+' + x : String(x));
+const lineOf = (o, m, which = 'cur') => o ? ((m === 'ml' ? o.ml?.[which] : o[which]) ?? null) : null;
 
 // ---------- storage (never required; app still works if it's blocked) ----------
 const store = {
@@ -63,7 +73,10 @@ function simplifyEvent(e) {
     if (ac === null && hc !== null) ac = -hc;
     if (ho === null && ao !== null) ho = -ao;
     if (ao === null && ho !== null) ao = -ho;
-    odds = { provider: o.provider?.name || 'Sportsbook', home: { cur: hc, open: ho }, away: { cur: ac, open: ao } };
+    const mlRaw = o.moneyline || {};
+    const ml = side => { const f = v => { const n = parseLine(v); return n === 0 ? 100 : n; };
+      return { cur: f(mlRaw[side]?.close?.odds), open: f(mlRaw[side]?.open?.odds) }; };
+    odds = { provider: o.provider?.name || 'Sportsbook', home: { cur: hc, open: ho, ml: ml('home') }, away: { cur: ac, open: ao, ml: ml('away') } };
   }
   return { id: e.id, start: e.date, state: st.type.state, detail: st.type.shortDetail || st.type.detail, home, away, odds };
 }
@@ -131,18 +144,19 @@ function renderGames() {
   else if (!S.games.length) body = `<div class="empty"><div class="big">🗓️</div>No ${LEAGUES[S.league].label} games this day.</div>`;
   else body = S.games.map(gameCard).join('');
   return `${setupNudge()}<div class="chips">${leagueChips}</div><div class="chips">${dayChips}</div>
-    <div class="note" style="margin:0 4px 10px">Lines: DraftKings via ESPN. Tap a game to set an alert.</div>${body}`;
+    <div class="note" style="margin:0 4px 10px">${LEAGUES[S.league].market === 'ml' ? 'Moneylines' : 'Spreads'}: DraftKings via ESPN. Tap a game to set an alert.</div>${body}`;
 }
 
 function gameCard(g) {
   const watched = S.watches.some(w => w.eventId === g.id && w.status !== 'done');
   const top = g.state === 'in' ? `<span class="live-dot">LIVE · ${esc(g.detail)}</span>`
     : g.state === 'post' ? `<span>${esc(g.detail)}</span>` : `<span>${timeStr(g.start)}</span>`;
+  const m = LEAGUES[S.league].market;
   const row = (t, side) => {
-    const o = g.odds?.[side];
-    const moved = o && o.open !== null && o.cur !== null && o.open !== o.cur;
-    const ln = o && o.cur !== null
-      ? `<span class="${moved ? 'moved' : ''}">${fmtLine(o.cur)}</span>${o.open !== null ? `<small>open ${fmtLine(o.open)}</small>` : ''}`
+    const o = g.odds?.[side], cur = lineOf(o, m), open = lineOf(o, m, 'open');
+    const moved = open !== null && cur !== null && open !== cur;
+    const ln = cur !== null
+      ? `<span class="${moved ? 'moved' : ''}">${fmtVal(cur, m)}</span>${open !== null ? `<small>open ${fmtVal(open, m)}</small>` : ''}`
       : `<span class="muted">no line</span>`;
     return `<div class="team-row"><img src="${esc(t.logo)}" alt="" loading="lazy"><div class="nm">${esc(t.short)}</div>
       <div class="sc">${g.state === 'pre' ? '' : (t.score ?? '')}</div><div class="ln">${ln}</div></div>`;
@@ -168,14 +182,15 @@ function watchCard(w) {
   const alert = w.lastAlert && w.status !== 'armed'
     ? `<div class="alert-box"><b>${esc(w.lastAlert.title)}</b>\n${esc(w.lastAlert.message)}</div>` : '';
   const fin = w.status === 'done' && w.final ? ` · Final ${esc(w.final)}` : '';
+  const m = w.market || 'spread';
   return `<div class="card watch">
     <div class="watch-head"><div><div class="t">${esc(w.teamAbbr)} ${w.isHome ? 'vs' : '@'} ${esc(w.oppAbbr)}</div>
-      <div class="s">${esc(LEAGUES[w.league]?.label || '')} · ${when}${fin}</div></div>
+      <div class="s">${esc(LEAGUES[w.league]?.label || '')} · ${m === 'ml' ? 'Moneyline' : 'Spread'} · ${when}${fin}</div></div>
       <span class="status ${w.status}">${statusLabel(w)}</span></div>
     <div class="nums">
-      <div class="num"><div class="k">Opened</div><div class="v">${fmtLine(w.openLine)}</div></div>
-      <div class="num"><div class="k">Now</div><div class="v">${fmtLine(w.lastLine)}</div></div>
-      <div class="num"><div class="k">Target</div><div class="v" style="color:var(--good-text)">${fmtLine(w.target)}</div></div>
+      <div class="num"><div class="k">Opened</div><div class="v">${fmtVal(w.openLine, m)}</div></div>
+      <div class="num"><div class="k">Now</div><div class="v">${fmtVal(w.lastLine, m)}</div></div>
+      <div class="num"><div class="k">Target</div><div class="v" style="color:var(--good-text)">${fmtVal(w.target, m)}</div></div>
     </div>
     ${spark(w)}
     <div class="note">${w.lastLineAt ? 'Line last moved ' + ago(w.lastLineAt) : ''}${w.repeat ? ' · alerts again if it bounces back' : ' · alerts once'}</div>
@@ -189,10 +204,11 @@ function watchCard(w) {
 
 // Tiny line chart of the spread over time with the target as a dashed line.
 function spark(w) {
-  const h = (w.history || []).filter(p => p[1] !== null);
+  const m = w.market || 'spread';
+  const h = (w.history || []).filter(p => p[1] !== null).map(p => [p[0], scale(p[1], m)]);
   if (h.length < 2) return '';
-  const W = 320, H = 64, pad = 6;
-  const ys = h.map(p => p[1]).concat([w.target]);
+  const W = 320, H = 64, pad = 6, tgt = scale(w.target, m);
+  const ys = h.map(p => p[1]).concat([tgt]);
   const lo = Math.min(...ys), hi = Math.max(...ys), span = Math.max(hi - lo, 1);
   const t0 = h[0][0], t1 = Math.max(h[h.length - 1][0], Date.now() - 1), ts = Math.max(t1 - t0, 1);
   const x = t => pad + (t - t0) / ts * (W - pad * 2), y = v => pad + (hi - v) / span * (H - pad * 2);
@@ -200,7 +216,7 @@ function spark(w) {
   for (let i = 1; i < h.length; i++) d += ` H${x(h[i][0]).toFixed(1)} V${y(h[i][1]).toFixed(1)}`;
   d += ` H${x(t1).toFixed(1)}`;
   return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Line history">
-    <line x1="0" x2="${W}" y1="${y(w.target)}" y2="${y(w.target)}" stroke="var(--target)" stroke-dasharray="4 4" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+    <line x1="0" x2="${W}" y1="${y(tgt)}" y2="${y(tgt)}" stroke="var(--target)" stroke-dasharray="4 4" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
     <path d="${d}" fill="none" stroke="var(--line)" stroke-width="2.2" vector-effect="non-scaling-stroke"/></svg>`;
 }
 
@@ -220,13 +236,13 @@ function renderSettings() {
   <div class="card">
     <b>Test it</b>
     <div class="note">Sends a test push through ntfy. If it doesn't show on your lock screen, check that ntfy notifications are on in iPhone Settings and that you're subscribed to your topic in the ntfy app.</div>
-    <button class="btn" id="test-btn"${configured() ? '' : 'disabled'}>Send test alert</button>
+    <button class="btn" id="test-btn" ${configured() ? '' : 'disabled'}>Send test alert</button>
     <button class="btn secondary" id="check-btn" ${configured() ? '' : 'disabled'}>Run a check now</button>
     <pre id="check-log" class="note" style="white-space:pre-wrap;margin:10px 0 0"></pre>
   </div>
   <div class="card note">
     <b style="color:var(--text)">How it works</b><br>
-    Your Cloudflare watcher checks about every 8 seconds from 30 min before tip until the final (every 15 min before that). When the team's spread reaches your target or better, it pushes an alert with the score, the injury report, and a warning if the line moved more than the score explains. It never places bets.
+    Your Cloudflare watcher checks about every 8 seconds from 30 min before the start until the final (every 15 min before that). When the team's spread or moneyline reaches your target or better, it pushes an alert with the score, the injury report, and a warning if the line moved more than the score explains. It never places bets.
   </div>`;
 }
 
@@ -237,55 +253,69 @@ function openSheet(html) {
 }
 function closeSheet() { $('#sheet').hidden = true; $('#sheet-backdrop').hidden = true; sheet.state = null; }
 
+const STEP = { spread: 0.5, ml: 5 };                       // one tap of − / + (moneyline in cents)
+const QUICK = { spread: [3, 5, 8, 10], ml: [20, 40, 60, 100] };
+const stepTarget = (t, dir, m) => unscale(scale(t, m) + dir * STEP[m], m);
+
 function openGameSheet(g) {
+  const m = LEAGUES[S.league].market;
   // Start on the favorite (the "wait for a better number" case); one tap switches sides.
-  const fav = g.odds && g.odds.home.cur !== null ? (g.odds.home.cur <= 0 ? 'home' : 'away') : 'home';
-  sheet.state = { g, side: fav, target: null, repeat: false };
+  const h = lineOf(g.odds?.home, m);
+  const fav = h !== null ? (scale(h, m) <= 0 ? 'home' : 'away') : 'home';
+  sheet.state = { g, side: fav, market: m, target: null, repeat: false };
   setDefaultTarget();
   drawGameSheet();
 }
-function curLine() { const s = sheet.state; return s.g.odds?.[s.side]?.cur ?? null; }
+function curLine() { const s = sheet.state; return lineOf(s.g.odds?.[s.side], s.market); }
 function setDefaultTarget() {
-  const c = curLine();
-  sheet.state.target = c === null ? -2 : c + 4;   // a few points better than now
+  const c = curLine(), m = sheet.state.market;
+  // a bit better than now: 4 points, or 40 cents on the moneyline
+  sheet.state.target = c === null ? (m === 'ml' ? 120 : -2) : unscale(scale(c, m) + (m === 'ml' ? 40 : 4), m);
 }
-function explain(abbr, t) {
-  if (t < 0) return `Alert when <b>${esc(abbr)}</b> is favored by <b>${-t}</b> or less`;
-  if (t === 0) return `Alert when <b>${esc(abbr)}</b> is a pick'em or an underdog`;
-  return `Alert when <b>${esc(abbr)}</b> is getting <b>+${t}</b> or more`;
+function explain(abbr, t, m = 'spread') {
+  const a = `<b>${esc(abbr)}</b>`;
+  if (m === 'ml') {
+    if (t > 0) return `Alert when ${a} moneyline is <b>+${t}</b> or better<br><small>($100 bet wins $${t})</small>`;
+    return `Alert when ${a} moneyline is <b>${t}</b> or better<br><small>(bet $${-t} to win $100)</small>`;
+  }
+  if (t < 0) return `Alert when ${a} is favored by <b>${-t}</b> or less`;
+  if (t === 0) return `Alert when ${a} is a pick'em or an underdog`;
+  return `Alert when ${a} is getting <b>+${t}</b> or more`;
 }
 function drawGameSheet() {
-  const { g, side, target, repeat } = sheet.state;
+  const { g, side, target, repeat, market: m } = sheet.state;
   const team = g[side], c = curLine();
   const btn = sd => {
-    const t = g[sd], o = g.odds?.[sd];
+    const t = g[sd], cur = lineOf(g.odds?.[sd], m), open = lineOf(g.odds?.[sd], m, 'open');
     return `<button data-side="${sd}" class="${sd === side ? 'on' : ''}"><img src="${esc(t.logo)}" alt=""><b>${esc(t.short)}</b>
-      <span>${o?.cur !== null && o?.cur !== undefined ? fmtLine(o.cur) : 'no line'}${o?.open !== null && o?.open !== undefined ? ` · open ${fmtLine(o.open)}` : ''}</span></button>`;
+      <span>${cur !== null ? fmtVal(cur, m) : 'no line'}${open !== null ? ` · open ${fmtVal(open, m)}` : ''}</span></button>`;
   };
-  const already = c !== null && c >= target;
+  const already = c !== null && scale(c, m) >= scale(target, m);
+  const unit = m === 'ml' ? '¢' : ' pts';
   openSheet(`<h3>${esc(g.away.abbr)} @ ${esc(g.home.abbr)}</h3>
     <div class="note">${g.state === 'in' ? 'Live · ' + esc(g.detail) : timeStr(g.start)} · tap the team you'd bet on</div>
+    <div class="seg"><button data-market="spread" class="${m === 'spread' ? 'on' : ''}">Spread</button><button data-market="ml" class="${m === 'ml' ? 'on' : ''}">Moneyline</button></div>
     <div class="pick">${btn('away')}${btn('home')}</div>
-    <label class="f" style="text-align:center">Target line for ${esc(team.abbr)}</label>
-    <div class="stepper"><button data-step="-0.5" aria-label="Lower">−</button><div class="val">${fmtLine(target)}</div><button data-step="0.5" aria-label="Higher">+</button></div>
-    <div class="explain">${explain(team.abbr, target)}${already ? '<br><span class="bad">It\'s already there now, so this alerts on the next check.</span>' : ''}</div>
-    ${c !== null ? `<div class="quick">${[3, 5, 8, 10].map(n => `<button class="mini" data-quick="${n}">${n} pts better</button>`).join('')}</div>` : ''}
-    <label class="toggle"><span>Alert again if it bounces back<small>Re-arms after the line moves ${'1.5'} pts back past your target</small></span>
+    <label class="f" style="text-align:center">Target ${m === 'ml' ? 'moneyline' : 'line'} for ${esc(team.abbr)}</label>
+    <div class="stepper"><button data-step="-1" aria-label="Lower">−</button><div class="val">${fmtVal(target, m)}</div><button data-step="1" aria-label="Higher">+</button></div>
+    <div class="explain">${explain(team.abbr, target, m)}${already ? '<br><span class="bad">It\'s already there now, so this alerts on the next check.</span>' : ''}</div>
+    ${c !== null ? `<div class="quick">${QUICK[m].map(n => `<button class="mini" data-quick="${n}">${n}${unit} better</button>`).join('')}</div>` : ''}
+    <label class="toggle"><span>Alert again if it bounces back<small>Re-arms after it moves ${m === 'ml' ? '20¢' : '1.5 pts'} back past your target</small></span>
       <input type="checkbox" id="repeat" ${repeat ? 'checked' : ''}></label>
     <button class="btn" id="save-watch" ${configured() ? '' : 'disabled'}>${configured() ? 'Watch this line' : 'Finish Setup to save alerts'}</button>
     <button class="btn secondary" id="close-sheet">Cancel</button>`);
 }
 
 function openEditSheet(w) {
-  sheet.state = { edit: w, target: w.target };
+  sheet.state = { edit: w, target: w.target, market: w.market || 'spread' };
   drawEditSheet();
 }
 function drawEditSheet() {
-  const { edit: w, target } = sheet.state;
+  const { edit: w, target, market: m } = sheet.state;
   openSheet(`<h3>${esc(w.teamAbbr)} ${w.isHome ? 'vs' : '@'} ${esc(w.oppAbbr)}</h3>
-    <div class="note">Now ${fmtLine(w.lastLine)} · opened ${fmtLine(w.openLine)}</div>
-    <div class="stepper" style="margin-top:16px"><button data-step="-0.5">−</button><div class="val">${fmtLine(target)}</div><button data-step="0.5">+</button></div>
-    <div class="explain">${explain(w.teamAbbr, target)}</div>
+    <div class="note">${m === 'ml' ? 'Moneyline' : 'Spread'} · now ${fmtVal(w.lastLine, m)} · opened ${fmtVal(w.openLine, m)}</div>
+    <div class="stepper" style="margin-top:16px"><button data-step="-1">−</button><div class="val">${fmtVal(target, m)}</div><button data-step="1">+</button></div>
+    <div class="explain">${explain(w.teamAbbr, target, m)}</div>
     <button class="btn" id="save-edit">Save and re-arm</button>
     <button class="btn secondary" id="close-sheet">Cancel</button>`);
 }
@@ -301,16 +331,17 @@ document.addEventListener('click', async e => {
   if (d.day !== undefined) { S.day = +d.day; S.games = []; loadGames(); return; }
   if (d.game) { const g = S.games.find(x => x.id === d.game); if (g) openGameSheet(g); return; }
   if (d.side) { sheet.state.side = d.side; setDefaultTarget(); drawGameSheet(); return; }
-  if (d.step) { sheet.state.target = Math.round((sheet.state.target + +d.step) * 2) / 2; sheet.state.edit ? drawEditSheet() : drawGameSheet(); return; }
-  if (d.quick) { sheet.state.target = curLine() + +d.quick; drawGameSheet(); return; }
+  if (d.market) { sheet.state.market = d.market; setDefaultTarget(); drawGameSheet(); return; }
+  if (d.step) { const s = sheet.state; s.target = stepTarget(s.target, +d.step, s.market); s.edit ? drawEditSheet() : drawGameSheet(); return; }
+  if (d.quick) { const s = sheet.state; s.target = unscale(scale(curLine(), s.market) + +d.quick, s.market); drawGameSheet(); return; }
   if (t.id === 'close-sheet') { closeSheet(); return; }
   if (t.id === 'save-watch') {
-    const { g, side, target } = sheet.state;
+    const { g, side, target, market } = sheet.state;
     const repeat = $('#repeat').checked;
     t.disabled = true; t.textContent = 'Saving…';
     try {
-      await api('/api/watches', { method: 'POST', body: JSON.stringify({ league: S.league, date: ymd(dayDate(S.day)), eventId: g.id, teamId: g[side].id, target, repeat }) });
-      closeSheet(); toast(`Watching ${g[side].abbr} for ${fmtLine(target)} or better`); await loadWatches();
+      await api('/api/watches', { method: 'POST', body: JSON.stringify({ league: S.league, date: ymd(dayDate(S.day)), eventId: g.id, teamId: g[side].id, target, repeat, market }) });
+      closeSheet(); toast(`Watching ${g[side].abbr} for ${fmtVal(target, market)}${market === 'ml' ? ' ML' : ''} or better`); await loadWatches();
     } catch (err) { toast('Could not save: ' + err.message); t.disabled = false; t.textContent = 'Watch this line'; }
     return;
   }

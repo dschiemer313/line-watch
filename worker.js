@@ -11,11 +11,22 @@
 
 const LEAGUES = {
   nba:   { path: 'basketball/nba', label: 'NBA' },
-  wnba:  { path: 'basketball/wnba', label: 'WNBA' },
-  ncaab: { path: 'basketball/mens-college-basketball', label: 'NCAAB', groups: '50' },
+  nhl:   { path: 'hockey/nhl', label: 'NHL' },
   nfl:   { path: 'football/nfl', label: 'NFL' },
+  ncaab: { path: 'basketball/mens-college-basketball', label: 'NCAAB', groups: '50' },
   ncaaf: { path: 'football/college-football', label: 'NCAAF', groups: '80' },
+  mlb:   { path: 'baseball/mlb', label: 'MLB' },
+  wnba:  { path: 'basketball/wnba', label: 'WNBA' },
+  mls:   { path: 'soccer/usa.1', label: 'MLS' },
+  epl:   { path: 'soccer/eng.1', label: 'EPL' },
 };
+
+// Two kinds of alert: point spread, or moneyline (American odds). "Better" always means a bigger payout
+// for the team you'd bet on. Moneylines compare on a cents scale so -110 → -105 → +100 → +110 is smooth.
+const REARM_GAP_ML = 20;          // moneyline re-arm gap, in cents
+export const scale = (x, market) => market === 'ml' ? (x >= 100 ? x - 100 : x <= -100 ? x + 100 : 0) : x;
+export const fmtVal = (x, market) => market !== 'ml' ? fmtLine(x)
+  : (x === null || x === undefined) ? '—' : (x > 0 ? '+' + x : String(x));
 
 const FAST_EVERY_SEC = 8;         // during games, re-check this often inside each 1-minute cron run
 const FAST_WINDOW_SEC = 50;       // stop before the next cron run starts
@@ -84,6 +95,11 @@ export function simplifyEvent(e) {
     if (awayCur === null && homeCur !== null) awayCur = -homeCur;
     if (homeOpen === null && awayOpen !== null) homeOpen = -awayOpen;
     if (awayOpen === null && homeOpen !== null) awayOpen = -homeOpen;
+    const mlRaw = o.moneyline || {};
+    const ml = side => {
+      const f = v => { const n = parseLine(v); return n === 0 ? 100 : n; };   // "EVEN" = +100
+      return { cur: f(mlRaw[side]?.close?.odds), open: f(mlRaw[side]?.open?.odds) };
+    };
     let link = null;
     try {
       const href = ps.home?.close?.link?.href || o.link?.href || '';
@@ -91,13 +107,20 @@ export function simplifyEvent(e) {
       if (pre && pre.includes('draftkings.com/event/')) link = pre.split('?')[0];
     } catch { /* no link */ }
     odds = { provider: o.provider?.name || 'Sportsbook', details: o.details || null, overUnder: o.overUnder ?? null,
-             home: { cur: homeCur, open: homeOpen }, away: { cur: awayCur, open: awayOpen }, link };
+             home: { cur: homeCur, open: homeOpen, ml: ml('home') }, away: { cur: awayCur, open: awayOpen, ml: ml('away') }, link };
   }
   return {
     id: e.id, name: e.name, shortName: e.shortName, start: e.date,
     state: st.type.state, completed: !!st.type.completed, detail: st.type.shortDetail || st.type.detail,
     period: st.period, clock: st.displayClock, home, away, odds,
   };
+}
+
+// The watched team's number for a market: which = 'cur' or 'open'.
+export function pickLine(g, isHome, market, which = 'cur') {
+  const side = g.odds?.[isHome ? 'home' : 'away'];
+  if (!side) return null;
+  return (market === 'ml' ? side.ml?.[which] : side[which]) ?? null;
 }
 
 async function fetchGames(league, date, fresh = false) {
@@ -129,13 +152,14 @@ async function fetchInjuries(league, eventId, teamId) {
 }
 
 // ---------- the decision logic (pure, tested in test.mjs) ----------
-// line = the watched team's spread (negative = favored). Met when line >= target ("target or better").
+// line = the watched team's spread (negative = favored) or moneyline. Met when line is target or better.
 export function evaluate(w, g, line) {
   const out = { met: false, fire: false, rearm: false, warnings: [] };
   if (line === null || line === undefined) return out;
-  out.met = line >= w.target - 1e-9;
+  const m = w.market || 'spread', s = x => scale(x, m);
+  out.met = s(line) >= s(w.target) - 1e-9;
   if (w.status === 'armed' && out.met) out.fire = true;
-  if (w.status === 'fired' && w.repeat && line <= w.target - REARM_GAP) out.rearm = true;
+  if (w.status === 'fired' && w.repeat && s(line) <= s(w.target) - (m === 'ml' ? REARM_GAP_ML : REARM_GAP)) out.rearm = true;
 
   const isHome = g.home.id === w.teamId;
   const me = isHome ? g.home : g.away, opp = isHome ? g.away : g.home;
@@ -143,6 +167,12 @@ export function evaluate(w, g, line) {
   // baseLine = the line when you set the watch; pregameLine = last line seen before tip-off.
   const base = w.baseLine ?? w.openLine ?? null;
   const pre = w.pregameLine ?? base;
+  if (m === 'ml') {
+    if (g.state === 'pre' && base !== null && s(line) - s(base) >= 40) {
+      out.warnings.push(`Moneyline moved from ${fmtVal(base, m)} to ${fmtVal(line, m)} before the game. Pre-game moves are usually injury/lineup news (in hockey, often the starting goalie).`);
+    }
+    return out;   // the score-vs-line check only makes sense for point spreads
+  }
   if (g.state === 'pre' && base !== null && line - base >= 2) {
     out.warnings.push(`Moved ${line - base} pts before tip-off. Pre-game moves are usually injury/lineup news, so check who's playing.`);
   }
@@ -159,14 +189,15 @@ export function evaluate(w, g, line) {
 export function buildAlert(w, g, line, provider, injuries, warnings) {
   const isHome = g.home.id === w.teamId;
   const me = isHome ? g.home : g.away, opp = isHome ? g.away : g.home;
-  const title = `${me.abbr} ${fmtLine(line)}: target hit (opened ${fmtLine(w.openLine)})`;
+  const m = w.market || 'spread', ml = m === 'ml' ? ' ML' : '';
+  const title = `${me.abbr} ${fmtVal(line, m)}${ml}: target hit (opened ${fmtVal(w.openLine, m)})`;
   const lines = [];
   if (g.state === 'in') {
     lines.push(`${me.abbr} ${me.score ?? 0} - ${opp.abbr} ${opp.score ?? 0} · ${g.detail || ''}`.trim());
   } else if (g.state === 'pre') {
     lines.push(`Pre-game · ${g.detail || ''} vs ${opp.abbr}`);
   }
-  lines.push(`Your target: ${fmtLine(w.target)} or better · ${provider || 'DraftKings'} via ESPN`);
+  lines.push(`Your target: ${fmtVal(w.target, m)}${ml} or better · ${provider || 'DraftKings'} via ESPN`);
   for (const x of warnings) lines.push('⚠️ ' + x);
   if (injuries) {
     const baseline = new Set((w.injuryBaseline || []).map(i => i.name));
@@ -229,19 +260,19 @@ export async function runCheck(env, { force = false, memo = new Map(), pass = 0 
       updates.set(w.id, u); log.push(`${w.teamAbbr}: final, watch closed`); continue;
     }
     const isHome = g.home.id === w.teamId;
-    let line = g.odds ? (isHome ? g.odds.home.cur : g.odds.away.cur) : null;
+    const m = w.market || 'spread';
+    let line = pickLine(g, isHome, m);
     let provider = g.odds?.provider || null;
     // The scoreboard (refreshed every ~7s) is the main source. Once a minute, see whether ESPN also
     // lists a dedicated live-odds provider; use it only if it exists (that feed is cached longer).
-    if (g.state === 'in' && pass === 0) {
+    if (g.state === 'in' && pass === 0 && m === 'spread') {
       const live = await liveLineFromCore(w.league, w.eventId, isHome);
       if (live && /live/i.test(live.provider)) { line = live.line; provider = live.provider; }
     }
     if (line === null) { log.push(`${w.teamAbbr}: no line posted (often pulled during reviews/timeouts)`); continue; }
 
     if (w.openLine === null || w.openLine === undefined) {
-      const o = g.odds ? (isHome ? g.odds.home.open : g.odds.away.open) : null;
-      u.openLine = o ?? line;
+      u.openLine = pickLine(g, isHome, m, 'open') ?? line;
     }
     const wNow = { ...w, ...u };
     const ev = evaluate(wNow, g, line);
@@ -259,12 +290,12 @@ export async function runCheck(env, { force = false, memo = new Map(), pass = 0 
       try {
         await notify(env, alert);
         u.status = 'fired'; u.firedAt = t; u.firedLine = line; u.lastAlert = alert;
-        log.push(`${w.teamAbbr}: ALERT sent at ${fmtLine(line)}`);
+        log.push(`${w.teamAbbr}: ALERT sent at ${fmtVal(line, m)}`);
       } catch (e) { log.push(`${w.teamAbbr}: alert failed ${e.message}`); }
     } else if (ev.rearm) {
-      u.status = 'armed'; log.push(`${w.teamAbbr}: re-armed (line back to ${fmtLine(line)})`);
+      u.status = 'armed'; log.push(`${w.teamAbbr}: re-armed (line back to ${fmtVal(line, m)})`);
     } else {
-      log.push(`${w.teamAbbr}: ${fmtLine(line)} (target ${fmtLine(w.target)}) ${w.status}`);
+      log.push(`${w.teamAbbr}${m === 'ml' ? ' ML' : ''}: ${fmtVal(line, m)} (target ${fmtVal(w.target, m)}) ${w.status}`);
     }
     if (Object.keys(u).length) updates.set(w.id, u);
   }
@@ -299,6 +330,7 @@ export async function runMinute(env, sleep = ms => new Promise(r => setTimeout(r
 // ---------- HTTP API for the phone app ----------
 async function createWatch(env, body) {
   const { league, eventId, teamId, target, repeat = false, date } = body;
+  const market = body.market === 'ml' ? 'ml' : 'spread';
   if (!LEAGUES[league]) throw new Error('unknown league');
   if (typeof target !== 'number' || !Number.isFinite(target)) throw new Error('target must be a number');
   const games = await fetchGames(league, date);
@@ -307,12 +339,12 @@ async function createWatch(env, body) {
   const isHome = g.home.id === String(teamId);
   if (!isHome && g.away.id !== String(teamId)) throw new Error('team not in that game');
   const me = isHome ? g.home : g.away, opp = isHome ? g.away : g.home;
-  const cur = g.odds ? (isHome ? g.odds.home.cur : g.odds.away.cur) : null;
-  const open = g.odds ? (isHome ? g.odds.home.open : g.odds.away.open) : null;
+  const cur = pickLine(g, isHome, market);
+  const open = pickLine(g, isHome, market, 'open');
   const injuries = await fetchInjuries(league, g.id, me.id);
   const w = {
     id: crypto.randomUUID().slice(0, 8), league, date, eventId: g.id, start: g.start,
-    teamId: me.id, teamAbbr: me.abbr, teamName: me.name, oppAbbr: opp.abbr, isHome,
+    teamId: me.id, teamAbbr: me.abbr, teamName: me.name, oppAbbr: opp.abbr, isHome, market,
     target, repeat: !!repeat, status: 'armed', created: now(),
     openLine: open ?? cur, baseLine: cur, pregameLine: g.state === 'pre' ? cur : (open ?? cur), lastLine: cur, lastLineAt: now(), provider: g.odds?.provider || null,
     history: cur === null ? [] : [[now(), cur, me.score, opp.score, g.state === 'in' ? g.detail : g.state]],

@@ -88,6 +88,19 @@ const ev3 = evaluate({ status: 'armed', target: -2, teamId: '1', openLine: 99, b
 assert.ok(!ev3.fire && ev3.warnings.length === 1); console.log('Pre-game move check:  ', ev3.warnings[0]);
 assert.equal(parseLine('PK'), 0); assert.equal(parseLine('+3.5'), 3.5);
 
+// Moneyline: "better" = bigger payout, smooth across ±100
+const mw = { status: 'armed', target: 150, teamId: '1', market: 'ml', baseLine: 110, repeat: true };
+assert.equal(evaluate(mw, g, 140).fire, false);
+assert.equal(evaluate(mw, g, 150).fire, true);
+assert.equal(evaluate(mw, g, 175).fire, true);
+assert.equal(evaluate({ ...mw, target: -105 }, g, -110).fire, false);
+assert.equal(evaluate({ ...mw, target: -105 }, g, 100).fire, true);
+assert.equal(evaluate({ ...mw, target: -105 }, g, -105).fire, true);
+assert.equal(evaluate({ ...mw, status: 'fired' }, g, 135).rearm, false);
+assert.equal(evaluate({ ...mw, status: 'fired' }, g, 130).rearm, true);
+assert.equal(evaluate(mw, { ...g, state: 'in' }, 200).warnings.length, 0, 'no score heuristic for moneylines');
+console.log('Moneyline checks:      +140 no, +150 yes, -110 vs -105 no, EVEN vs -105 yes, re-arm at +130');
+
 console.log(`\nKV writes during simulated game: ${writes}`);
 
 // --- fast loop: one cron minute, line drops partway through, should alert on that pass, once ---
@@ -107,4 +120,20 @@ Date.now = realNow; globalThis.fetch = prevFetch;
 console.log(`\nFast loop: ${passes} checks in one minute (every ${Math.round(50 / (passes - 1))}s-ish); alert on check #4 of ${fetches}; pushes sent: ${pushes.length}`);
 assert.ok(passes >= 6, 'should check about every 8s');
 assert.equal(pushes.length, 1, 'exactly one alert even though the line stayed at/through target for several checks');
+
+// Moneyline watch end-to-end on the real game's real moneyline data
+kv.clear(); pushes.length = 0;
+const mlNow = (await (await realFetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates=${date}`)).json())
+  .events.find(e => e.id === ev.id).competitions[0].odds[0].moneyline;
+comp.odds[0].moneyline = JSON.parse(JSON.stringify(mlNow));
+const homeML = Number(mlNow.home.close.odds);
+const mlw = await call('POST', '/api/watches', { league: 'nba', date, eventId: ev.id, teamId: homeC.team.id, target: homeML + 30, market: 'ml' });
+assert.equal(mlw.market, 'ml'); assert.equal(mlw.lastLine, homeML);
+setGame({ state: 'in', homeScore: 30, awayScore: 44, homeLine: -2 });
+comp.odds[0].moneyline.home.close.odds = String(homeML + 10);
+let r1 = await runCheck(env, { force: true });
+comp.odds[0].moneyline.home.close.odds = '+250';
+let r2 = await runCheck(env, { force: true });
+console.log(`\nMoneyline watch: ${r1.log[0]}  →  ${r2.log[0]}`);
+assert.equal(pushes.length, 1); console.log('  alert title:', pushes[0].title);
 console.log('\nALL TESTS PASSED');
