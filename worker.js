@@ -87,6 +87,9 @@ export function inWindow(w, g) {
 // for the team you'd bet on. Moneylines compare on a cents scale so -110 → -105 → +100 → +110 is smooth.
 const REARM_GAP_ML = 20;          // moneyline re-arm gap, in cents
 export const scale = (x, market) => market === 'ml' ? (x >= 100 ? x - 100 : x <= -100 ? x + 100 : 0) : x;
+export const unscale = (s, market) => market === 'ml' ? (s >= 0 ? s + 100 : s - 100) : s;
+// "Swing" watches: target = line at tip-off + swing (negative = moves against the team). Live only.
+export const fromSwing = (base, swing, market) => unscale(scale(base, market) + swing, market);
 export const fmtVal = (x, market) => market !== 'ml' ? fmtLine(x)
   : (x === null || x === undefined) ? '—' : (x > 0 ? '+' + x : String(x));
 
@@ -220,9 +223,13 @@ export function evaluate(w, g, line) {
   const out = { met: false, fire: false, rearm: false, warnings: [] };
   if (line === null || line === undefined) return out;
   const m = w.market || 'spread', s = x => scale(x, m);
-  out.met = s(line) >= s(w.target) - 1e-9;
+  const gap = m === 'ml' ? REARM_GAP_ML : REARM_GAP;
+  // dir 'down' = alert when the line moves AGAINST the team (target or worse)
+  const down = w.dir === 'down';
+  out.met = down ? s(line) <= s(w.target) + 1e-9 : s(line) >= s(w.target) - 1e-9;
   if (w.status === 'armed' && out.met) out.fire = true;
-  if (w.status === 'fired' && w.repeat && s(line) <= s(w.target) - (m === 'ml' ? REARM_GAP_ML : REARM_GAP)) out.rearm = true;
+  if (w.status === 'fired' && w.repeat && (down ? s(line) >= s(w.target) + gap : s(line) <= s(w.target) - gap)) out.rearm = true;
+  if (down) return out;   // the injury heuristics below are about a team's number getting better
 
   const isHome = g.home.id === w.teamId;
   const me = isHome ? g.home : g.away, opp = isHome ? g.away : g.home;
@@ -253,14 +260,16 @@ export function buildAlert(w, g, line, provider, injuries, warnings) {
   const isHome = g.home.id === w.teamId;
   const me = isHome ? g.home : g.away, opp = isHome ? g.away : g.home;
   const m = w.market || 'spread', ml = m === 'ml' ? ' ML' : '';
-  const title = `${me.abbr} ${fmtVal(line, m)}${ml}: target hit (opened ${fmtVal(w.openLine, m)})`;
+  const title = typeof w.swing === 'number' && w.tipLine != null
+    ? `${me.abbr} ${fmtVal(line, m)}${ml}: moved ${w.swing > 0 ? '+' : ''}${w.swing}${m === 'ml' ? '¢' : ''} from tip-off ${fmtVal(w.tipLine, m)}`
+    : `${me.abbr} ${fmtVal(line, m)}${ml}: target hit (opened ${fmtVal(w.openLine, m)})`;
   const lines = [];
   if (g.state === 'in') {
     lines.push(`${me.abbr} ${me.score ?? 0} - ${opp.abbr} ${opp.score ?? 0} · ${g.detail || ''}`.trim());
   } else if (g.state === 'pre') {
     lines.push(`Pre-game · ${g.detail || ''} vs ${opp.abbr}`);
   }
-  lines.push(`Your target: ${fmtVal(w.target, m)}${ml} or better${w.until ? ` (until ${untilLabel(w.league, w.until)})` : ''} · ${provider || 'DraftKings'} via ESPN`);
+  lines.push(`Your target: ${fmtVal(w.target, m)}${ml} or ${w.dir === 'down' ? 'worse' : 'better'}${w.until ? ` (until ${untilLabel(w.league, w.until)})` : ''} · ${provider || 'DraftKings'} via ESPN`);
   for (const x of warnings) lines.push('⚠️ ' + x);
   if (injuries) {
     const baseline = new Set((w.injuryBaseline || []).map(i => i.name));
@@ -341,8 +350,16 @@ export async function runCheck(env, { force = false, memo = new Map(), pass = 0 
     if (w.openLine === null || w.openLine === undefined) {
       u.openLine = pickLine(g, isHome, m, 'open') ?? line;
     }
+    const isSwing = typeof w.swing === 'number';
+    // Swing watch: at the first live check, lock in the tip-off line (last pre-game line seen) and set the target.
+    if (isSwing && g.state === 'in' && (w.tipLine === null || w.tipLine === undefined)) {
+      u.tipLine = w.pregameLine ?? line;
+      u.target = fromSwing(u.tipLine, w.swing, m);
+      log.push(`${w.teamAbbr}: tip-off line ${fmtVal(u.tipLine, m)} → target ${fmtVal(u.target, m)}`);
+    }
     const wNow = { ...w, ...u };
-    const ev = evaluate(wNow, g, line);
+    const ev = isSwing && g.state !== 'in' ? { fire: false, rearm: false, warnings: [] }   // swing watches are live-only
+      : evaluate(wNow, g, line);
     const me = isHome ? g.home : g.away, opp = isHome ? g.away : g.home;
 
     if (line !== w.lastLine) {
@@ -362,7 +379,8 @@ export async function runCheck(env, { force = false, memo = new Map(), pass = 0 
     } else if (ev.rearm) {
       u.status = 'armed'; log.push(`${w.teamAbbr}: re-armed (line back to ${fmtVal(line, m)})`);
     } else {
-      log.push(`${w.teamAbbr}${m === 'ml' ? ' ML' : ''}: ${fmtVal(line, m)} (target ${fmtVal(w.target, m)}) ${w.status}`);
+      log.push(`${w.teamAbbr}${m === 'ml' ? ' ML' : ''}: ${fmtVal(line, m)} (target ${isSwing && wNow.target == null
+        ? `tip-off ${w.swing > 0 ? '+' : ''}${w.swing}` : fmtVal(wNow.target, m)}) ${w.status}`);
     }
     if (Object.keys(u).length) updates.set(w.id, u);
   }
@@ -411,7 +429,8 @@ async function createWatch(env, body) {
   const market = body.market === 'ml' ? 'ml' : 'spread';
   if (!LEAGUES[league]) throw new Error('unknown league');
   const until = cleanUntil(league, body.until);
-  if (typeof target !== 'number' || !Number.isFinite(target)) throw new Error('target must be a number');
+  const swing = typeof body.swing === 'number' && Number.isFinite(body.swing) && body.swing !== 0 ? Math.round(body.swing * 100) / 100 : null;
+  if (swing === null && (typeof target !== 'number' || !Number.isFinite(target))) throw new Error('need a target or a swing');
   const games = await fetchGames(league, date);
   const g = games.find(x => x.id === String(eventId));
   if (!g) throw new Error('game not found for that date');
@@ -424,7 +443,11 @@ async function createWatch(env, body) {
   const w = {
     id: crypto.randomUUID().slice(0, 8), league, date, eventId: g.id, start: g.start,
     teamId: me.id, teamAbbr: me.abbr, teamName: me.name, oppAbbr: opp.abbr, isHome, market, until,
-    target, repeat: !!repeat, status: 'armed', created: now(),
+    dir: swing !== null ? (swing < 0 ? 'down' : 'up') : (body.dir === 'down' ? 'down' : 'up'),
+    // swing watch set mid-game: the "tip-off" reference is the line right now
+    swing, tipLine: swing !== null && g.state === 'in' ? cur : null,
+    target: swing === null ? target : (g.state === 'in' && cur !== null ? fromSwing(cur, swing, market) : null),
+    repeat: !!repeat, status: 'armed', created: now(),
     openLine: open ?? cur, baseLine: cur, pregameLine: g.state === 'pre' ? cur : (open ?? cur), lastLine: cur, lastLineAt: now(), provider: g.odds?.provider || null,
     history: cur === null ? [] : [[now(), cur, me.score, opp.score, g.state === 'in' ? g.detail : g.state]],
     injuryBaseline: (injuries || []).filter(i => /out|doubt|question|day-to-day/i.test(i.status)),
@@ -457,7 +480,13 @@ export default {
         const list = await loadWatches(env);
         const w = list.find(x => x.id === m[1]);
         if (!w) return json({ error: 'not found' }, 404);
-        if (typeof body.target === 'number') w.target = body.target;
+        if (typeof body.swing === 'number' && Number.isFinite(body.swing) && body.swing !== 0) {
+          w.swing = Math.round(body.swing * 100) / 100; w.dir = w.swing < 0 ? 'down' : 'up';
+          w.target = w.tipLine != null ? fromSwing(w.tipLine, w.swing, w.market || 'spread') : null;
+        } else if (typeof body.target === 'number') {
+          w.target = body.target; w.swing = null;                      // switched to an exact line
+          if (body.dir === 'up' || body.dir === 'down') w.dir = body.dir;
+        }
         if (typeof body.repeat === 'boolean') w.repeat = body.repeat;
         if ('until' in body) w.until = cleanUntil(w.league, body.until);
         if (body.status === 'armed') w.status = 'armed';

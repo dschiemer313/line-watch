@@ -99,7 +99,16 @@ assert.equal(evaluate({ ...mw, target: -105 }, g, -105).fire, true);
 assert.equal(evaluate({ ...mw, status: 'fired' }, g, 135).rearm, false);
 assert.equal(evaluate({ ...mw, status: 'fired' }, g, 130).rearm, true);
 assert.equal(evaluate(mw, { ...g, state: 'in' }, 200).warnings.length, 0, 'no score heuristic for moneylines');
-console.log('Moneyline checks:      +140 no, +150 yes, -110 vs -105 no, EVEN vs -105 yes, re-arm at +130');
+// Negative swing: BOS opened -10, alert if it moves 2 AGAINST them (to -12 or worse)
+const dw = { status: 'armed', target: -12, teamId: '1', dir: 'down', openLine: -10, repeat: true };
+assert.equal(evaluate(dw, g, -10).fire, false, 'at the opener: no alert');
+assert.equal(evaluate(dw, g, -11.5).fire, false);
+assert.equal(evaluate(dw, g, -12).fire, true);
+assert.equal(evaluate(dw, g, -14).fire, true);
+assert.equal(evaluate({ ...dw, status: 'fired' }, g, -11).rearm, false);
+assert.equal(evaluate({ ...dw, status: 'fired' }, g, -10.5).rearm, true);
+console.log('Against-the-team (-2) checks: -10 no, -11.5 no, -12 yes, -14 yes, re-arm at -10.5');
+console.log('Moneyline checks:     +140 no, +150 yes, -110 vs -105 no, EVEN vs -105 yes, re-arm at +130');
 
 console.log(`\nKV writes during simulated game: ${writes}`);
 
@@ -136,6 +145,31 @@ comp.odds[0].moneyline.home.close.odds = '+250';
 let r2 = await runCheck(env, { force: true });
 console.log(`\nMoneyline watch: ${r1.log[0]}  →  ${r2.log[0]}`);
 assert.equal(pushes.length, 1); console.log('  alert title:', pushes[0].title);
+// --- swing from the tip-off line (live only) ---
+for (const [swing, path, wantFireAt] of [
+  [9.5, [['pre', -10], ['pre', -11], ['in', -11], ['in', -5], ['in', -1.5], ['in', -2]], 4],      // tip -11 → target -1.5
+  [-2, [['pre', -10], ['pre', -10.5], ['in', -10.5], ['in', -12], ['in', -12.5]], 4],            // tip -10.5 → target -12.5
+]) {
+  kv.clear(); pushes.length = 0;
+  setGame({ state: 'pre', homeScore: 0, awayScore: 0, homeLine: path[0][1], detail: '7:30 PM' });
+  const sw = await call('POST', '/api/watches', { league: 'nba', date, eventId: ev.id, teamId: homeC.team.id, swing });
+  assert.equal(sw.target, null); assert.equal(sw.dir, swing < 0 ? 'down' : 'up');
+  const logs = [];
+  for (let i = 0; i < path.length; i++) {
+    const [state, ln] = path[i];
+    setGame({ state, homeScore: 40, awayScore: 44, homeLine: ln, detail: state === 'pre' ? '7:30 PM' : 'Q2 4:12' });
+    if (state === 'in') { comp.status.period = 2; comp.status.clock = 250; }
+    const r = await runCheck(env, { force: true });
+    logs.push(r.log.join(' | '));
+    if (i + 1 < wantFireAt) assert.equal(pushes.length, 0, `no alert yet at step ${i}: ${logs.at(-1)}`);
+  }
+  assert.equal(pushes.length, 1, 'exactly one alert');
+  const st = JSON.parse(kv.get('watches'))[0];
+  console.log(`\nSwing ${swing > 0 ? '+' : ''}${swing} from tip-off: tip ${st.tipLine} → target ${st.target}`);
+  logs.forEach((l, i) => console.log(`  ${path[i][0]} ${String(path[i][1]).padStart(5)}: ${l}`));
+  console.log('  alert:', pushes[0].title);
+}
+
 // --- "only alert until" cutoffs ---
 const at = (league, until, game) => inWindow({ league, until }, { state: 'in', ...game });
 const q2 = { p: 2, left: 0 }, q2_2min = { p: 2, left: 120 };
