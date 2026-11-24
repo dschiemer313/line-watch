@@ -113,6 +113,11 @@ input[type=text], input[type=password], input[type=url] {
 .stepper.small .val { font-size: 26px; }
 .stepper .val small { font-size: 14px; font-weight: 600; color: var(--muted); }
 .sheet .chips { flex-wrap: wrap; }
+.swing-row { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 4px; }
+.swing-row input { width: 110px; font: inherit; font-size: 28px; font-weight: 750; text-align: center; padding: 8px 10px; border-radius: 12px;
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text); font-variant-numeric: tabular-nums; }
+.swing-row span { font-size: 15px; font-weight: 600; color: var(--text-2); }
+.mini.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 
 /* bottom sheet */
 .sheet-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 20; }

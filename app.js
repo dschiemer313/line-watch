@@ -231,7 +231,8 @@ function watchCard(w) {
     <div class="nums">
       <div class="num"><div class="k">Opened</div><div class="v">${fmtVal(w.openLine, m)}</div></div>
       <div class="num"><div class="k">Now</div><div class="v">${fmtVal(w.lastLine, m)}</div></div>
-      <div class="num"><div class="k">Target</div><div class="v" style="color:var(--good-text)">${fmtVal(w.target, m)}</div></div>
+      <div class="num"><div class="k">Target</div><div class="v" style="color:var(--good-text)">${fmtVal(w.target, m)}</div>
+        ${swingOf(w.target, w.openLine, m) !== null ? `<div class="k" style="text-transform:none">${swingOf(w.target, w.openLine, m)}${m === 'ml' ? '¢' : ' pts'} swing</div>` : ''}</div>
     </div>
     ${spark(w)}
     <div class="note">${w.lastLineAt ? 'Line last moved ' + ago(w.lastLineAt) : ''}${w.repeat ? ' · alerts again if it bounces back' : ' · alerts once'}</div>
@@ -334,8 +335,32 @@ function adjustUntil(league, u, d) {
 }
 
 const STEP = { spread: 0.5, ml: 5 };                      // one tap of − / + (moneyline in cents)
-const QUICK = { spread: [3, 5, 8, 10], ml: [20, 40, 60, 100] };
+const SWING_QUICK = { spread: [8.5, 9.5, 10, 12.5], ml: [40, 60, 80, 100] };
+const DEFAULT_SWING = { spread: 10, ml: 60 };               // from the 2-year Celtics backtest sweet spot
 const stepTarget = (t, dir, m) => unscale(scale(t, m) + dir * STEP[m], m);
+const swingOf = (target, base, m) => base === null || base === undefined ? null : Math.round((scale(target, m) - scale(base, m)) * 100) / 100;
+const fromSwing = (base, sw, m) => unscale(scale(base, m) + sw, m);
+
+// "Swing from opener" box: type how far the line has to move from the opening number; the target follows.
+function swingRow(base, target, m) {
+  if (base === null || base === undefined) return '';
+  const sw = swingOf(target, base, m), unit = m === 'ml' ? '¢' : 'pts';
+  return `<label class="f" style="text-align:center">Swing from the opener (opened ${fmtVal(base, m)})</label>
+    <div class="swing-row"><input id="swing" type="number" inputmode="decimal" step="${STEP[m]}" value="${sw}" aria-label="Swing from opener">
+      <span>${unit} better</span></div>
+    <div class="quick">${SWING_QUICK[m].map(n => `<button class="mini ${n === sw ? 'on' : ''}" data-swing="${n}">${n}${m === 'ml' ? '¢' : ''}</button>`).join('')}</div>`;
+}
+// Update the target display while typing, without redrawing (keeps the keyboard up).
+function onSwingInput(v) {
+  const s = sheet.state;
+  if (!s || s.base === null || s.base === undefined || !Number.isFinite(v)) return;
+  s.target = fromSwing(s.base, v, s.market);
+  const val = document.querySelector('#sheet .stepper .val');
+  if (val) val.textContent = fmtVal(s.target, s.market);
+  const ex = document.querySelector('#sheet .explain');
+  if (ex) ex.innerHTML = explain(s.edit ? s.edit.teamAbbr : s.g[s.side].abbr, s.target, s.market);
+  document.querySelectorAll('#sheet [data-swing]').forEach(b => b.classList.toggle('on', +b.dataset.swing === v));
+}
 
 function openGameSheet(g) {
   const m = LEAGUES[S.league].market;
@@ -347,10 +372,11 @@ function openGameSheet(g) {
   drawGameSheet();
 }
 function curLine() { const s = sheet.state; return lineOf(s.g.odds?.[s.side], s.market); }
+function openLine() { const s = sheet.state; return lineOf(s.g.odds?.[s.side], s.market, 'open') ?? curLine(); }
 function setDefaultTarget() {
-  const c = curLine(), m = sheet.state.market;
-  // a bit better than now: 4 points, or 40 cents on the moneyline
-  sheet.state.target = c === null ? (m === 'ml' ? 120 : -2) : unscale(scale(c, m) + (m === 'ml' ? 40 : 4), m);
+  const b = openLine(), m = sheet.state.market;
+  // opener + the default swing (10 pts / 60¢)
+  sheet.state.target = b === null ? (m === 'ml' ? 120 : -2) : fromSwing(b, DEFAULT_SWING[m], m);
 }
 function explain(abbr, t, m = 'spread') {
   const a = `<b>${esc(abbr)}</b>`;
@@ -371,15 +397,15 @@ function drawGameSheet() {
       <span>${cur !== null ? fmtVal(cur, m) : 'no line'}${open !== null ? ` · open ${fmtVal(open, m)}` : ''}</span></button>`;
   };
   const already = c !== null && scale(c, m) >= scale(target, m);
-  const unit = m === 'ml' ? '¢' : ' pts';
+  sheet.state.base = openLine();
   openSheet(`<h3>${esc(g.away.abbr)} @ ${esc(g.home.abbr)}</h3>
     <div class="note">${g.state === 'in' ? 'Live · ' + esc(g.detail) : timeStr(g.start)} · tap the team you'd bet on</div>
     <div class="seg"><button data-market="spread" class="${m === 'spread' ? 'on' : ''}">Spread</button><button data-market="ml" class="${m === 'ml' ? 'on' : ''}">Moneyline</button></div>
     <div class="pick">${btn('away')}${btn('home')}</div>
+    ${swingRow(sheet.state.base, target, m)}
     <label class="f" style="text-align:center">Target ${m === 'ml' ? 'moneyline' : 'line'} for ${esc(team.abbr)}</label>
     <div class="stepper"><button data-step="-1" aria-label="Lower">−</button><div class="val">${fmtVal(target, m)}</div><button data-step="1" aria-label="Higher">+</button></div>
     <div class="explain">${explain(team.abbr, target, m)}${already ? '<br><span class="bad">It\'s already there now, so this alerts on the next check.</span>' : ''}</div>
-    ${c !== null ? `<div class="quick">${QUICK[m].map(n => `<button class="mini" data-quick="${n}">${n}${unit} better</button>`).join('')}</div>` : ''}
     ${whenPicker(sheet.state.league, sheet.state.until, g)}
     <label class="toggle"><span>Alert again if it bounces back<small>Re-arms after it moves ${m === 'ml' ? '20¢' : '1.5 pts'} back past your target</small></span>
       <input type="checkbox" id="repeat" ${repeat ? 'checked' : ''}></label>
@@ -393,9 +419,12 @@ function openEditSheet(w) {
 }
 function drawEditSheet() {
   const { edit: w, target, market: m } = sheet.state;
+  sheet.state.base = w.openLine ?? w.lastLine ?? null;
   openSheet(`<h3>${esc(w.teamAbbr)} ${w.isHome ? 'vs' : '@'} ${esc(w.oppAbbr)}</h3>
     <div class="note">${m === 'ml' ? 'Moneyline' : 'Spread'} · now ${fmtVal(w.lastLine, m)} · opened ${fmtVal(w.openLine, m)}</div>
-    <div class="stepper" style="margin-top:16px"><button data-step="-1">−</button><div class="val">${fmtVal(target, m)}</div><button data-step="1">+</button></div>
+    ${swingRow(sheet.state.base, target, m)}
+    <label class="f" style="text-align:center">Target</label>
+    <div class="stepper"><button data-step="-1">−</button><div class="val">${fmtVal(target, m)}</div><button data-step="1">+</button></div>
     <div class="explain">${explain(w.teamAbbr, target, m)}</div>
     ${whenPicker(w.league, sheet.state.until, null)}
     <button class="btn" id="save-edit">Save and re-arm</button>
@@ -421,7 +450,7 @@ document.addEventListener('click', async e => {
     s.edit ? drawEditSheet() : drawGameSheet(); return;
   }
   if (d.step) { const s = sheet.state; s.target = stepTarget(s.target, +d.step, s.market); s.edit ? drawEditSheet() : drawGameSheet(); return; }
-  if (d.quick) { const s = sheet.state; s.target = unscale(scale(curLine(), s.market) + +d.quick, s.market); drawGameSheet(); return; }
+  if (d.swing) { const s = sheet.state; s.target = fromSwing(s.base, +d.swing, s.market); s.edit ? drawEditSheet() : drawGameSheet(); return; }
   if (t.id === 'close-sheet') { closeSheet(); return; }
   if (t.id === 'save-watch') {
     const { g, side, target, market, until } = sheet.state;
@@ -472,6 +501,7 @@ document.addEventListener('click', async e => {
   }
 });
 $('#sheet-backdrop').addEventListener('click', closeSheet);
+document.addEventListener('input', e => { if (e.target.id === 'swing') onSwingInput(parseFloat(e.target.value)); });
 
 // Keep it fresh while the app is open.
 setInterval(() => { if (document.visibilityState === 'visible' && !sheet.state) { loadGames(); loadWatches(); } }, 30000);
