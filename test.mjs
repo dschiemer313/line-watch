@@ -14,6 +14,7 @@ const env = {
   WATCH: {
     async get(k, type) { const v = kv.get(k); return v === undefined ? null : type === 'json' ? JSON.parse(v) : v; },
     async put(k, v) { kv.set(k, v); writes++; },
+    async list({ prefix = '' } = {}) { return { keys: [...kv.keys()].filter(k => k.startsWith(prefix)).map(name => ({ name })) }; },
   },
 };
 let writes = 0;
@@ -211,5 +212,31 @@ setGame({ state: 'in', homeScore: 55, awayScore: 64, homeLine: -1 }); comp.statu
 const c2 = await runCheck(env, { force: true });
 console.log(`\nUntil-Q2 watch: ${c1.log[0]}  →  ${c2.log[0]}`);
 assert.equal(pushes.length, 0); assert.equal(JSON.parse(kv.get('watches'))[0].status, 'done');
+
+// --- recorder: one simulated minute, line and score change across passes, saved once ---
+kv.clear(); writes = 0;
+await call('POST', '/api/record', { leagues: ['nba'] });
+const steps = [[2, 10, 12, -6], [2, 10, 12, -6], [2, 12, 12, -6.5], [2, 12, 15, -5], [2, 12, 15, -5], [2, 14, 15, -5.5], [2, 14, 18, -4]];
+let si = 0;
+const pf = globalThis.fetch;
+globalThis.fetch = async (url, opts) => {
+  if (String(url).includes('/scoreboard')) {
+    const [per, hs, as, ln] = steps[Math.min(si++, steps.length - 1)];
+    setGame({ state: 'in', homeScore: hs, awayScore: as, homeLine: ln }); comp.status.period = per; comp.status.clock = 400 - si * 8;
+  }
+  return pf(url, opts);
+};
+const rn = Date.now; let ck = rn(); Date.now = () => ck;
+const before = writes;
+await runMinute(env, async ms => { ck += ms; });
+Date.now = rn; globalThis.fetch = pf;
+const recList = await call('GET', '/api/record');
+const day = recList.days[0];
+const recData = await call('GET', `/api/record/${day.replace(':', '/')}`);
+const pts = recData.games[ev.id].points;
+console.log(`\nRecorder: ${pts.length} points saved for ${recData.games[ev.id].name} (from ${steps.length} checks; unchanged ones skipped), KV writes this minute: ${writes - before}`);
+pts.forEach(p => console.log(`  Q${p[1]} ${p[2]}s  ${p[3]}-${p[4]}  home ${p[5]}`));
+assert.equal(pts.length, 5);
+assert.equal(writes - before, 1, 'one write per minute');
 
 console.log('\nALL TESTS PASSED');

@@ -284,10 +284,56 @@ function renderSettings() {
     <button class="btn secondary" id="check-btn" ${configured() ? '' : 'disabled'}>Run a check now</button>
     <pre id="check-log" class="note" style="white-space:pre-wrap;margin:10px 0 0"></pre>
   </div>
+  ${recordCard()}
   <div class="card note">
     <b style="color:var(--text)">How it works</b><br>
     Your Cloudflare watcher checks about every 8 seconds from 30 min before the start until the final (every 15 min before that). When the team's spread or moneyline reaches your target or better, it pushes an alert with the score, the injury report, and a warning if the line moved more than the score explains. It never places bets.
   </div>`;
+}
+
+// ---------- live-line recorder (Setup tab) ----------
+async function loadRecord() {
+  if (!configured()) return;
+  try { S.record = await api('/api/record'); } catch (e) { S.record = { error: e.message }; }
+  if (S.tab === 'settings') render();
+}
+function recordCard() {
+  if (!configured()) return '';
+  const r = S.record;
+  if (!r) return `<div class="card note">Loading recorder…</div>`;
+  if (r.error) return `<div class="card note"><span class="bad">Recorder: ${esc(r.error)}</span></div>`;
+  const on = new Set(r.cfg?.leagues || []);
+  const boxes = Object.entries(LEAGUES).map(([k, L]) =>
+    `<label class="rec-box"><input type="checkbox" data-rec="${k}" ${on.has(k) ? 'checked' : ''}> ${L.label}</label>`).join('');
+  const days = (r.days || []).slice(0, 14).map(d => {
+    const [lg, date] = d.split(':');
+    return `<button class="mini" data-recdl="${esc(d)}">⬇ ${esc(LEAGUES[lg]?.label || lg)} ${date.slice(4, 6)}/${date.slice(6)}</button>`;
+  }).join('');
+  return `<div class="card">
+    <b>Record live lines</b>
+    <div class="note">Saves every DraftKings live-line change, with the score and clock, for every game in the leagues you tick. This shows how far real live lines move when a team falls behind, so the backtest can be calibrated to them. It records from 30 min before each game to the final.</div>
+    <div class="rec-boxes">${boxes}</div>
+    <button class="btn secondary" id="rec-save">Save recorder settings</button>
+    ${days ? `<div class="note" style="margin-top:12px">Recorded nights (tap to download a CSV):</div><div class="actions">${days}</div>` : '<div class="note" style="margin-top:10px">Nothing recorded yet.</div>'}
+  </div>`;
+}
+async function downloadRecord(day) {
+  const [lg, date] = day.split(':');
+  const data = await api(`/api/record/${lg}/${date}`);
+  const head = 'league,date,game_id,game,home,away,time_utc,period,clock_sec,home_score,away_score,home_spread,home_ml,away_ml,final_home,final_away';
+  const rows = [head];
+  for (const [id, g] of Object.entries(data.games || {})) {
+    for (const p of g.points) {
+      rows.push([lg, date, id, `"${g.name}"`, g.home, g.away, new Date(p[0]).toISOString(), ...p.slice(1).map(v => v ?? ''),
+        g.final?.[0] ?? '', g.final?.[1] ?? ''].join(','));
+    }
+  }
+  const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = `live-lines-${lg}-${date}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  toast(`Saved ${rows.length - 1} rows`);
 }
 
 // ---------- the "set alert" sheet ----------
@@ -466,7 +512,14 @@ document.addEventListener('click', async e => {
   const t = e.target.closest('button, [data-game], [data-go]');
   if (!t) return;
   const d = t.dataset;
-  if (d.tab) { S.tab = d.tab; render(); if (S.tab === 'watching') loadWatches(); window.scrollTo(0, 0); return; }
+  if (d.tab) { S.tab = d.tab; render(); if (S.tab === 'watching') loadWatches(); if (S.tab === 'settings') loadRecord(); window.scrollTo(0, 0); return; }
+  if (t.id === 'rec-save') {
+    const leagues = [...document.querySelectorAll('[data-rec]')].filter(x => x.checked).map(x => x.dataset.rec);
+    try { await api('/api/record', { method: 'POST', body: JSON.stringify({ leagues }) }); toast(leagues.length ? `Recording ${leagues.map(l => LEAGUES[l].label).join(', ')}` : 'Recorder off'); loadRecord(); }
+    catch (err) { toast('Could not save: ' + err.message); }
+    return;
+  }
+  if (d.recdl) { try { await downloadRecord(d.recdl); } catch (err) { toast('Download failed: ' + err.message); } return; }
   if (d.go) { e.preventDefault(); S.tab = d.go; render(); return; }
   if (d.league) { S.league = d.league; store.set('league', S.league); S.games = []; loadGames(); return; }
   if (d.day !== undefined) { S.day = +d.day; S.games = []; loadGames(); return; }

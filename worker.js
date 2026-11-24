@@ -399,17 +399,63 @@ export async function runCheck(env, { force = false, memo = new Map(), pass = 0 
 
 // Cron fires once a minute; during games keep re-checking every few seconds until just before the next run.
 export async function runMinute(env, sleep = ms => new Promise(r => setTimeout(r, ms))) {
-  const start = now(), memo = new Map();
+  const start = now(), memo = new Map(), rec = { books: {}, dirty: new Set() };
   let pass = 0, r;
   do {
     r = await runCheck(env, { memo, pass });
+    const recLive = await recordPass(env, rec).catch(e => { console.log('record failed', e.message); return false; });
     pass++;
-    if (!r.fast) break;
+    if (!r.fast && !recLive) break;
     const wait = start + pass * FAST_EVERY_SEC * 1000 - now();
     if (now() + Math.max(wait, 0) > start + FAST_WINDOW_SEC * 1000) break;
     if (wait > 0) await sleep(wait);
   } while (true);
+  // One KV write per recorded league-day per minute, only if something changed (stays inside free KV limits).
+  for (const key of rec.dirty) await env.WATCH.put(key, JSON.stringify(rec.books[key]));
   return pass;
+}
+
+// ---------- live-line recorder ----------
+// For every game in the chosen leagues, saves each change in DraftKings' line or the score, with the clock:
+// point = [time, period (0 = pre-game), clock seconds, home score, away score, home spread, home ML, away ML].
+// Used to measure how far real live lines move when a team falls behind (see worker/calibrate.py).
+const MAX_POINTS = 3000;
+const etParts = t => Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric',
+  month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false }).formatToParts(t).map(p => [p.type, p.value]));
+export const etDate = (t = now()) => { const p = etParts(t); return p.year + p.month + p.day; };
+export const recKey = (league, date) => `rec:${league}:${date}`;
+
+export async function recordPass(env, rec) {
+  if (!rec.cfg) rec.cfg = (await env.WATCH.get('record', 'json')) || { leagues: [] };
+  let busy = false;
+  for (const lg of rec.cfg.leagues || []) {
+    if (!LEAGUES[lg]) continue;
+    const dates = [etDate()];
+    if (Number(etParts(now()).hour) < 4) dates.push(etDate(now() - 86400000));   // late games past midnight ET
+    for (const date of dates) {
+      const key = recKey(lg, date);
+      let games;
+      try { games = await fetchGames(lg, date, true); } catch { continue; }
+      const book0 = rec.books[key];
+      const relevant = games.filter(g => g.state === 'in'
+        || (g.state === 'pre' && Date.parse(g.start) - now() < PREGAME_LEAD_MIN * 60000)
+        || (g.state === 'post' && book0?.games[g.id] && !book0.games[g.id].final));
+      if (!relevant.length) continue;
+      if (relevant.some(g => g.state !== 'post')) busy = true;
+      if (!rec.books[key]) rec.books[key] = (await env.WATCH.get(key, 'json')) || { league: lg, date, games: {} };
+      const book = rec.books[key];
+      for (const g of relevant) {
+        const e = book.games[g.id] ||= { name: g.shortName || g.name, home: g.home.abbr, away: g.away.abbr, start: g.start, points: [] };
+        if (g.state === 'post') { e.final = [g.home.score, g.away.score]; rec.dirty.add(key); continue; }
+        const pt = [now(), g.state === 'in' ? g.period : 0, g.clockSec, g.home.score ?? 0, g.away.score ?? 0,
+          g.odds?.home?.cur ?? null, g.odds?.home?.ml?.cur ?? null, g.odds?.away?.ml?.cur ?? null];
+        const last = e.points[e.points.length - 1];
+        const changed = !last || [1, 3, 4, 5, 6, 7].some(i => pt[i] !== last[i]);   // the clock alone doesn't count
+        if (changed && e.points.length < MAX_POINTS) { e.points.push(pt); rec.dirty.add(key); }
+      }
+    }
+  }
+  return busy;
 }
 
 // ---------- HTTP API for the phone app ----------
@@ -502,6 +548,19 @@ export default {
         return json({ ok: true });
       }
       if (p === '/api/check' && req.method === 'POST') return json(await runCheck(env, { force: true }));
+      // Recorder: GET config + saved days, POST {leagues: ['nba']} to turn on ([] = off), GET one day's data.
+      if (p === '/api/record' && req.method === 'GET') {
+        const keys = (await env.WATCH.list({ prefix: 'rec:' })).keys.map(k => k.name);
+        return json({ cfg: (await env.WATCH.get('record', 'json')) || { leagues: [] }, days: keys.map(k => k.slice(4)).sort().reverse() });
+      }
+      if (p === '/api/record' && req.method === 'POST') {
+        const body = await req.json();
+        const leagues = (Array.isArray(body.leagues) ? body.leagues : []).filter(l => LEAGUES[l]);
+        await env.WATCH.put('record', JSON.stringify({ leagues }));
+        return json({ leagues });
+      }
+      const rm = p.match(/^\/api\/record\/(\w+)\/(\d{8})$/);
+      if (rm && req.method === 'GET') return json((await env.WATCH.get(recKey(rm[1], rm[2]), 'json')) || { games: {} });
       return json({ error: 'not found' }, 404);
     } catch (e) {
       return json({ error: e.message }, 400);

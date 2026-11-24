@@ -117,6 +117,9 @@ input[type=text], input[type=password], input[type=url] {
 .swing-row input { width: 110px; font: inherit; font-size: 28px; font-weight: 750; text-align: center; padding: 8px 10px; border-radius: 12px;
   border: 1px solid var(--border); background: var(--surface-2); color: var(--text); font-variant-numeric: tabular-nums; }
 .swing-row span { font-size: 15px; font-weight: 600; color: var(--text-2); }
+.rec-boxes { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 10px; }
+.rec-box { display: flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 600; }
+.rec-box input { width: 18px; height: 18px; accent-color: var(--accent); }
 .mini.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 
 /* bottom sheet */
