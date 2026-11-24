@@ -220,7 +220,7 @@ function renderSettings() {
   <div class="card">
     <b>Test it</b>
     <div class="note">Sends a test push through ntfy. If it doesn't show on your lock screen, check that ntfy notifications are on in iPhone Settings and that you're subscribed to your topic in the ntfy app.</div>
-    <button class="btn secondary" id="test-btn" ${configured() ? '' : 'disabled'}>Send test alert</button>
+    <button class="btn" id="test-btn"${configured() ? '' : 'disabled'}>Send test alert</button>
     <button class="btn secondary" id="check-btn" ${configured() ? '' : 'disabled'}>Run a check now</button>
     <pre id="check-log" class="note" style="white-space:pre-wrap;margin:10px 0 0"></pre>
   </div>
