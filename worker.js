@@ -352,7 +352,7 @@ export function buildAlert(w, g, line, provider, injuries, warnings) {
   const me = isHome ? g.home : g.away, opp = isHome ? g.away : g.home;
   const m = w.market || 'spread', ml = m === 'ml' ? ' ML' : '';
   const title = typeof w.swing === 'number' && w.tipLine != null
-    ? `${me.abbr} ${fmtVal(line, m)}${ml}: moved ${w.swing > 0 ? '+' : ''}${w.swing}${m === 'ml' ? '¢' : ''} from tip-off ${fmtVal(w.tipLine, m)}`
+    ? `${me.abbr} ${fmtVal(line, m)}${ml}: moved ${w.swing > 0 ? '+' : ''}${w.swing}${m === 'ml' ? '¢' : ''} from ${w.from === 'now' ? '' : 'tip-off '}${fmtVal(w.tipLine, m)}${w.from === 'now' ? ' (when you set it)' : ''}`
     : `${me.abbr} ${fmtVal(line, m)}${ml}: target hit (opened ${fmtVal(w.openLine, m)})`;
   const lines = [];
   if (g.state === 'in') {
@@ -611,14 +611,18 @@ async function createWatch(env, body) {
   const open = pickLine(g, isHome, market, 'open');
   // pre-game (closing) line; the phone sends what it sees when ESPN won't answer the watcher
   const num = v => typeof v === 'number' && Number.isFinite(v) ? v : null;
-  const tip = g.state === 'in' ? (pickLine(g, isHome, market, 'tip') ?? num(body.tipLine) ?? cur ?? num(body.liveLine)) : null;
+  // from: 'now' = set during a live game, measured from the live line at the moment you tapped Watch
+  const fromNow = g.state === 'in' && body.from === 'now';
+  const tip = g.state !== 'in' ? null
+    : fromNow ? (num(body.liveLine) ?? cur)
+    : (pickLine(g, isHome, market, 'tip') ?? num(body.tipLine) ?? cur ?? num(body.liveLine));
   const injuries = await fetchInjuries(league, g.id, me.id);
   const w = {
     id: crypto.randomUUID().slice(0, 8), league, date, eventId: g.id, start: g.start,
     teamId: me.id, teamAbbr: me.abbr, teamName: me.name, oppAbbr: opp.abbr, isHome, market, until,
     dir: swing !== null ? (swing < 0 ? 'down' : 'up') : (body.dir === 'down' ? 'down' : 'up'),
     // swing watch set mid-game: measured from the real tip-off line (from the odds feed)
-    swing, tipLine: swing !== null && g.state === 'in' ? tip : null,
+    swing, tipLine: swing !== null && g.state === 'in' ? tip : null, from: fromNow ? 'now' : 'tip',
     target: swing === null ? target : (g.state === 'in' && tip !== null ? fromSwing(tip, swing, market) : null),
     repeat: !!repeat, status: 'armed', created: now(),
     openLine: open ?? cur, baseLine: cur, pregameLine: g.state === 'pre' ? cur : (tip ?? open ?? cur), lastLine: cur, lastLineAt: now(), provider: g.odds?.provider || null,

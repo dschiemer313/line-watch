@@ -226,7 +226,9 @@ function beep() {
   });
 }
 function showHit(w, line, tip, target, m) {
-  const sw = typeof w.swing === 'number' ? `moved ${signed(w.swing, m)}${m === 'ml' ? '' : ' pts'} from tip-off ${fmtVal(tip, m)}` : `target ${fmtVal(target, m)}`;
+  const sw = typeof w.swing === 'number'
+    ? `moved ${signed(w.swing, m)}${m === 'ml' ? '' : ' pts'} from ${w.from === 'now' ? '' : 'tip-off '}${fmtVal(tip, m)}${w.from === 'now' ? ' (when you set it)' : ''}`
+    : `target ${fmtVal(target, m)}`;
   const el = document.createElement('div');
   el.className = 'hit';
   el.innerHTML = `<div class="hit-card"><div class="hit-tag">🚨 LINE ALERT</div>
@@ -352,11 +354,11 @@ function watchCard(w) {
       <span class="status ${w.status}">${statusLabel(w)}</span></div>
     <div class="nums">
       ${typeof w.swing === 'number'
-        ? `<div class="num"><div class="k">Tip-off</div><div class="v">${w.tipLine != null ? fmtVal(w.tipLine, m) : '—'}</div></div>`
+        ? `<div class="num"><div class="k">${w.from === 'now' ? 'When set' : 'Tip-off'}</div><div class="v">${w.tipLine != null ? fmtVal(w.tipLine, m) : '—'}</div></div>`
         : `<div class="num"><div class="k">Opened</div><div class="v">${fmtVal(w.openLine, m)}</div></div>`}
       <div class="num"><div class="k">Now</div><div class="v">${fmtVal(w.lastLine, m)}</div></div>
       <div class="num"><div class="k">Target</div><div class="v" style="color:var(--good-text)">${w.target == null ? 'At tip' : fmtVal(w.target, m)}</div>
-        ${typeof w.swing === 'number' ? `<div class="k" style="text-transform:none">${signed(w.swing, m)}${m === 'ml' ? '' : ' pts'} from tip${w.tipLine != null ? ` (${fmtVal(w.tipLine, m)})` : ''}</div>` : ''}</div>
+        ${typeof w.swing === 'number' ? `<div class="k" style="text-transform:none">${signed(w.swing, m)}${m === 'ml' ? '' : ' pts'} from ${w.from === 'now' ? 'when set' : 'tip'}${w.tipLine != null ? ` (${fmtVal(w.tipLine, m)})` : ''}</div>` : ''}</div>
     </div>
     ${spark(w)}
     <div class="note">${pl && w.status === 'armed' ? `Live line checked ${Math.max(0, Math.round((Date.now() - pl.at) / 1000))}s ago by this phone` : w.lastLineAt ? 'Line last moved ' + ago(w.lastLineAt) : ''}${w.repeat ? ' · alerts again if it bounces back' : ' · alerts once'}</div>
@@ -530,8 +532,8 @@ function explain(abbr, t, m = 'spread', dir = 'up') {
 }
 
 // Two ways to set an alert: "Move from tip-off" (swing, live only) or "Exact line".
-function modeSeg(mode) {
-  return `<div class="seg"><button data-mode="swing" class="${mode === 'swing' ? 'on' : ''}">Move from tip-off</button>
+function modeSeg(mode, live = false) {
+  return `<div class="seg"><button data-mode="swing" class="${mode === 'swing' ? 'on' : ''}">${live ? 'Move from now' : 'Move from tip-off'}</button>
     <button data-mode="exact" class="${mode === 'exact' ? 'on' : ''}">Exact line</button></div>`;
 }
 // ref = { line, label }: the number the swing is measured from (or a stand-in before tip-off)
@@ -541,14 +543,15 @@ function swingPreview(abbr, sw, m, ref) {
   if (ref.line === null || ref.line === undefined) return `Alerts once the line moves <b>${move}</b> from where it is at tip-off.`;
   return `${ref.label} <b>${fmtVal(ref.line, m)}</b> → ${explain(abbr, fromSwing(ref.line, sw, m), m, dir)}`;
 }
-function swingBody(abbr, sw, m, ref) {
-  return `<label class="f" style="text-align:center">How far the live line has to move from tip-off</label>
+function swingBody(abbr, sw, m, ref, live = false) {
+  return `<label class="f" style="text-align:center">How far the live line has to move from ${live ? 'where it is now' : 'tip-off'}</label>
     <div class="swing-row"><input id="swing" type="text" inputmode="text" value="${Number.isFinite(sw) ? signed(sw, 'spread') : ''}" aria-label="Swing from tip-off" autocomplete="off">
       <span>${m === 'ml' ? '¢' : 'pts'}</span></div>
     <div class="note" style="text-align:center">+ = moves toward ${esc(abbr)} · − = moves against</div>
     <div class="quick">${SWING_QUICK[m].map(n => `<button class="mini ${n === sw ? 'on' : ''}" data-swing="${n}">${signed(n, m)}</button>`).join('')}</div>
     <div class="explain swing-preview">${swingPreview(abbr, sw, m, ref)}</div>
-    <div class="note" style="text-align:center">Live only: pre-game moves don't count. The tip-off line locks in when the game starts.</div>`;
+    <div class="note" style="text-align:center">${live ? 'Game is live: it measures from the live line at the moment you tap Watch.'
+      : "Live only: pre-game moves don't count. The tip-off line locks in when the game starts."}</div>`;
 }
 function exactBody(abbr, target, m, cur) {
   const dir = dirOf(target, cur, m);
@@ -582,13 +585,10 @@ function sheetRef() {
   const s = sheet.state;
   if (s.edit) {
     const w = s.edit;
-    if (w.tipLine !== null && w.tipLine !== undefined) return { line: w.tipLine, label: 'Tip-off line was' };
+    if (w.tipLine !== null && w.tipLine !== undefined) return { line: w.tipLine, label: w.from === 'now' ? 'Line when you set it was' : 'Tip-off line was' };
     return { line: w.lastLine, label: 'If it tips at the current line' };
   }
-  if (s.g.state === 'in') {
-    const tip = lineOf(s.g.odds?.[s.side], s.market, 'tip');
-    return tip !== null ? { line: tip, label: 'Tip-off line was' } : { line: curLine(), label: 'Tip-off line unknown, so it measures from the line now:' };
-  }
+  if (s.g.state === 'in') return { line: curLine(), label: 'Live line now' };
   return { line: curLine(), label: 'If it tips at the current line' };
 }
 function setDefaultTarget() {
@@ -607,8 +607,8 @@ function drawGameSheet() {
     <div class="note">${g.state === 'in' ? 'Live · ' + esc(g.detail) : timeStr(g.start)} · tap the team you'd bet on</div>
     <div class="seg"><button data-market="spread" class="${m === 'spread' ? 'on' : ''}">Spread</button><button data-market="ml" class="${m === 'ml' ? 'on' : ''}">Moneyline</button></div>
     <div class="pick">${btn('away')}${btn('home')}</div>
-    ${modeSeg(mode)}
-    ${mode === 'swing' ? swingBody(team.abbr, swing, m, sheetRef()) : exactBody(team.abbr, target, m, c)}
+    ${modeSeg(mode, g.state === 'in')}
+    ${mode === 'swing' ? swingBody(team.abbr, swing, m, sheetRef(), g.state === 'in') : exactBody(team.abbr, target, m, c)}
     ${whenPicker(sheet.state.league, sheet.state.until, g)}
     <label class="toggle"><span>Alert again if it bounces back<small>Re-arms after it moves ${m === 'ml' ? '20¢' : '1.5 pts'} back past your target</small></span>
       <input type="checkbox" id="repeat" ${repeat ? 'checked' : ''}></label>
@@ -671,13 +671,18 @@ document.addEventListener('click', async e => {
     const body = { league: S.league, date: ymd(dayDate(S.day)), eventId: g.id, teamId: g[side].id, repeat, market, until };
     if (mode === 'swing') body.swing = swing; else { body.target = target; body.dir = dirOf(target, curLine(), market); }
     if (g.state === 'in') {                               // the watcher can't see live lines; send what this phone sees
+      await attachLiveOdds(LEAGUES[S.league], g);         // the line right now, not from the last list refresh
       body.tipLine = lineOf(g.odds?.[side], market, 'tip'); body.liveLine = curLine();
+      if (mode === 'swing') {
+        if (body.liveLine === null) { toast('No live line right now (DraftKings may have pulled it). Try again in a moment.'); return; }
+        body.from = 'now';                                   // measure from the live line at this moment
+      }
     }
     t.disabled = true; t.textContent = 'Saving…';
     try {
       await api('/api/watches', { method: 'POST', body: JSON.stringify(body) });
       closeSheet();
-      toast(mode === 'swing' ? `Watching ${g[side].abbr} for a ${signed(swing, market)}${market === 'ml' ? '' : ' pt'} move from tip-off`
+      toast(mode === 'swing' ? `Watching ${g[side].abbr} for a ${signed(swing, market)}${market === 'ml' ? '' : ' pt'} move from ${body.from === 'now' ? fmtVal(body.liveLine, market) : 'tip-off'}`
         : `Watching ${g[side].abbr} for ${fmtVal(target, market)}${market === 'ml' ? ' ML' : ''} or ${body.dir === 'down' ? 'worse' : 'better'}`);
       await loadWatches();
     } catch (err) { toast('Could not save: ' + err.message); t.disabled = false; t.textContent = 'Watch this line'; }
