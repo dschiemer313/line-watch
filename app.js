@@ -125,7 +125,7 @@ async function loadGames() {
   const L = LEAGUES[S.league];
   const q = new URLSearchParams({ dates: ymd(dayDate(S.day)) });
   if (L.groups) { q.set('groups', L.groups); q.set('limit', '400'); }
-  S.gamesLoading = true; render();
+  S.gamesLoading = true; softRender();
   try {
     const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${L.path}/scoreboard?${q}`);
     if (!r.ok) throw new Error('ESPN ' + r.status);
@@ -133,8 +133,32 @@ async function loadGames() {
     S.games = (d.events || []).map(simplifyEvent)
       .sort((a, b) => ({ in: 0, pre: 1, post: 2 }[a.state] - { in: 0, pre: 1, post: 2 }[b.state]) || a.start.localeCompare(b.start));
     S.gamesErr = null;
+    await Promise.all(S.games.filter(g => g.state === 'in').slice(0, 40).map(g => attachLiveOdds(L, g)));
   } catch (e) { S.gamesErr = e.message; }
-  S.gamesLoading = false; render();
+  S.gamesLoading = false; softRender();
+}
+
+// ESPN removes odds from the scoreboard once a game starts. The live line is in its odds feed under
+// "DraftKings - Live Odds" (the regular DraftKings entry there = the tip-off line). The feed is cached by
+// ESPN for minutes, so add a throwaway parameter to get the current number.
+async function attachLiveOdds(L, g) {
+  try {
+    const [sport, lg] = L.path.split('/');
+    const r = await fetch(`https://sports.core.api.espn.com/v2/sports/${sport}/leagues/${lg}/events/${g.id}/competitions/${g.id}/odds?_=${Date.now()}`);
+    if (!r.ok) return;
+    const items = (await r.json()).items || [];
+    const live = items.find(i => /live/i.test(i.provider?.name || ''));
+    const pre = items.find(i => i.provider?.id === '100') || items.find(i => !/live/i.test(i.provider?.name || ''));
+    if (!live) { g.odds = { live: true, none: true, home: {}, away: {} }; return; }
+    const f = (it, s) => {
+      const t = (s === 'home' ? it?.homeTeamOdds : it?.awayTeamOdds) || {};
+      const ml = parseLine(t.current?.moneyLine?.american ?? t.moneyLine);
+      return { spread: parseLine(t.current?.pointSpread?.american), ml: ml === 0 ? 100 : ml };
+    };
+    const side = s => ({ cur: f(live, s).spread, tip: pre ? f(pre, s).spread : null, open: null,
+      ml: { cur: f(live, s).ml, tip: pre ? f(pre, s).ml : null, open: null } });
+    g.odds = { provider: live.provider.name, live: true, home: side('home'), away: side('away') };
+  } catch { /* leave as "no line" */ }
 }
 
 // ---------- Worker API ----------
@@ -154,10 +178,16 @@ async function loadWatches() {
     const d = await api('/api/watches');
     S.watches = d.watches || []; S.heartbeat = d.heartbeat; S.watchErr = null;
   } catch (e) { S.watchErr = e.message; }
-  render();
+  softRender();
 }
 
 // ---------- rendering ----------
+// Background refreshes must not redraw the Setup tab: that would wipe what you've typed or ticked.
+function softRender() {
+  if (S.tab !== 'settings') return render();
+  const active = S.watches.filter(w => w.status !== 'done').length;
+  const b = $('#watch-count'); b.hidden = !active; b.textContent = active;
+}
 function render() {
   const active = S.watches.filter(w => w.status !== 'done').length;
   const b = $('#watch-count'); b.hidden = !active; b.textContent = active;
@@ -192,12 +222,13 @@ function gameCard(g) {
   const top = g.state === 'in' ? `<span class="live-dot">LIVE · ${esc(g.detail)}</span>`
     : g.state === 'post' ? `<span>${esc(g.detail)}</span>` : `<span>${timeStr(g.start)}</span>`;
   const m = LEAGUES[S.league].market;
+  const isLive = !!g.odds?.live;
   const row = (t, side) => {
-    const o = g.odds?.[side], cur = lineOf(o, m), open = lineOf(o, m, 'open');
-    const moved = open !== null && cur !== null && open !== cur;
+    const o = g.odds?.[side], cur = lineOf(o, m), ref = lineOf(o, m, isLive ? 'tip' : 'open');
+    const moved = ref !== null && cur !== null && ref !== cur;
     const ln = cur !== null
-      ? `<span class="${moved ? 'moved' : ''}">${fmtVal(cur, m)}</span>${open !== null ? `<small>open ${fmtVal(open, m)}</small>` : ''}`
-      : `<span class="muted">no line</span>`;
+      ? `<span class="${moved ? 'moved' : ''}">${fmtVal(cur, m)}</span>${ref !== null ? `<small>${isLive ? 'tip' : 'open'} ${fmtVal(ref, m)}</small>` : ''}`
+      : `<span class="muted">${g.state === 'in' ? 'no live line' : 'no line'}</span>`;
     return `<div class="team-row"><img src="${esc(t.logo)}" alt="" loading="lazy"><div class="nm">${esc(t.short)}</div>
       <div class="sc">${g.state === 'pre' ? '' : (t.score ?? '')}</div><div class="ln">${ln}</div></div>`;
   };
@@ -463,7 +494,11 @@ function sheetRef() {
     if (w.tipLine !== null && w.tipLine !== undefined) return { line: w.tipLine, label: 'Tip-off line was' };
     return { line: w.lastLine, label: 'If it tips at the current line' };
   }
-  return { line: curLine(), label: s.g.state === 'in' ? 'Game is live, so it measures from the line now:' : 'If it tips at the current line' };
+  if (s.g.state === 'in') {
+    const tip = lineOf(s.g.odds?.[s.side], s.market, 'tip');
+    return tip !== null ? { line: tip, label: 'Tip-off line was' } : { line: curLine(), label: 'Tip-off line unknown, so it measures from the line now:' };
+  }
+  return { line: curLine(), label: 'If it tips at the current line' };
 }
 function setDefaultTarget() {
   const c = curLine(), m = sheet.state.market;
@@ -576,7 +611,7 @@ document.addEventListener('click', async e => {
     store.set('url', url); store.set('key', key);
     const persisted = store.get('url', '') === url && store.get('key', '') === key;
     status.textContent = 'Checking…';
-    S.watchErr = null; await loadWatches();
+    S.watchErr = null; await loadWatches(); render(); loadRecord();
     if (S.watchErr) toast('Could not connect: ' + S.watchErr, 5000);
     else toast(persisted ? 'Connected ✓' : 'Connected, but this browser won\'t remember it (Private mode?)', 5000);
     return;

@@ -35,10 +35,22 @@ function setGame({ state, homeScore, awayScore, homeLine, detail = 'Q2 4:12' }) 
 }
 
 const pushes = [];
+const liveFeed = { odds: null, tipHome: null };   // used when the scoreboard has dropped its odds (live games)
 globalThis.fetch = async (url, opts) => {
   url = String(url);
   if (url.includes('/scoreboard')) return new Response(JSON.stringify(sb));
-  if (url.includes('sports.core.api.espn.com')) return new Response(JSON.stringify({ items: [] })); // no separate live provider
+  if (url.includes('sports.core.api.espn.com')) {
+    // Like real ESPN: during a game the odds feed has a "DraftKings - Live Odds" provider with the live line.
+    if (comp.status.type.state !== 'in') return new Response(JSON.stringify({ items: [] }));
+    const o = comp.odds?.[0] || liveFeed.odds;
+    const side = s => ({ current: { pointSpread: { american: String(o.pointSpread[s].close.line) },
+      moneyLine: { american: String(o.moneyline?.[s]?.close?.odds ?? '') } } });
+    return new Response(JSON.stringify({ items: [
+      { provider: { id: '100', name: 'DraftKings' }, homeTeamOdds: { current: { pointSpread: { american: String(liveFeed.tipHome ?? o.pointSpread.home.close.line) } } },
+        awayTeamOdds: { current: { pointSpread: { american: String(-(liveFeed.tipHome ?? o.pointSpread.home.close.line)) } } } },
+      { provider: { id: '200', name: 'DraftKings - Live Odds' }, homeTeamOdds: side('home'), awayTeamOdds: side('away') },
+    ] }));
+  }
   if (url.includes('ntfy')) { pushes.push(JSON.parse(opts.body)); return new Response('{}'); }
   return realFetch(url, opts);  // summary (injuries) stays real
 };
@@ -169,6 +181,26 @@ for (const [swing, path, wantFireAt] of [
   console.log(`\nSwing ${swing > 0 ? '+' : ''}${swing} from tip-off: tip ${st.tipLine} → target ${st.target}`);
   logs.forEach((l, i) => console.log(`  ${path[i][0]} ${String(path[i][1]).padStart(5)}: ${l}`));
   console.log('  alert:', pushes[0].title);
+}
+
+// --- real-ESPN shape: scoreboard has NO odds during the game; live line only in the odds feed ---
+{
+  kv.clear(); pushes.length = 0;
+  setGame({ state: 'pre', homeScore: 0, awayScore: 0, homeLine: -10, detail: '7:30 PM' });
+  await call('POST', '/api/watches', { league: 'nba', date, eventId: ev.id, teamId: homeC.team.id, swing: 7 });
+  const saved = comp.odds;
+  liveFeed.odds = JSON.parse(JSON.stringify(saved[0])); liveFeed.tipHome = -10;
+  const liveStep = async (hs, as, ln) => {
+    setGame({ state: 'in', homeScore: hs, awayScore: as, homeLine: ln }); comp.status.period = 2; comp.status.clock = 300;
+    liveFeed.odds.pointSpread.home.close.line = String(ln); liveFeed.odds.pointSpread.away.close.line = String(-ln);
+    delete comp.odds;                                     // what ESPN's scoreboard actually does once a game starts
+    const r = await runCheck(env, { force: true }); comp.odds = saved; return r.log.join(' | ');
+  };
+  const l1 = await liveStep(30, 33, -8);
+  const l2 = await liveStep(36, 47, -3);
+  console.log(`\nLive feed only (scoreboard odds removed):\n  ${l1}\n  ${l2}`);
+  assert.equal(pushes.length, 1, 'alert from the live feed alone'); console.log('  alert:', pushes[0].title);
+  liveFeed.odds = null; liveFeed.tipHome = null;
 }
 
 // --- "only alert until" cutoffs ---

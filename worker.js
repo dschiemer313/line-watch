@@ -132,8 +132,18 @@ const coreOddsUrl = (league, id) => {
   return `https://sports.core.api.espn.com/v2/sports/${sport}/leagues/${lg}/events/${id}/competitions/${id}/odds`;
 };
 
+// Cloudflare's free plan allows 50 outbound requests per run. runMinute sets a budget (alerts are checked
+// before recording, so they get first claim) and resets these per-pass caches so a feed is fetched once per pass.
+let BUDGET = Infinity;
+const PASS_CACHE = new Map();
+export function newPass() { PASS_CACHE.clear(); }
+export function setBudget(n) { BUDGET = n; }
+const cached = (key, fn) => { if (!PASS_CACHE.has(key)) PASS_CACHE.set(key, fn()); return PASS_CACHE.get(key); };
+
 async function getJSON(url, fresh = false) {
+  if (BUDGET-- <= 0) throw new Error('request budget for this minute used up');
   // fresh: add a throwaway param so neither Cloudflare nor ESPN's CDN hands back an older copy
+  // (ESPN caches the live-odds feed for up to 4 minutes otherwise)
   if (fresh) url += (url.includes('?') ? '&' : '?') + '_=' + Math.floor(Date.now() / 4000);
   const r = await fetch(url, { headers: { 'user-agent': 'line-watch/1.0' }, cache: 'no-store' });
   if (!r.ok) throw new Error(`${r.status} ${url}`);
@@ -183,29 +193,45 @@ export function simplifyEvent(e) {
 }
 
 // The watched team's number for a market: which = 'cur' or 'open'.
-export function pickLine(g, isHome, market, which = 'cur') {
+export function pickLine(g, isHome, market, which = 'cur') {   // which: 'cur' | 'open' | 'tip'
   const side = g.odds?.[isHome ? 'home' : 'away'];
   if (!side) return null;
   return (market === 'ml' ? side.ml?.[which] : side[which]) ?? null;
 }
 
 async function fetchGames(league, date, fresh = false) {
-  const d = await getJSON(scoreboardUrl(league, date), fresh);
-  return (d.events || []).map(simplifyEvent);
+  const go = async () => (await getJSON(scoreboardUrl(league, date), fresh)).events?.map(simplifyEvent) || [];
+  return fresh ? cached(`sb|${league}|${date}`, go) : go();
 }
 
-// During a live game ESPN sometimes lists a separate "live" provider; prefer it when present.
-async function liveLineFromCore(league, eventId, isHome) {
-  try {
-    const d = await getJSON(coreOddsUrl(league, eventId));
+// ESPN drops odds from the scoreboard once a game starts. The live line is in the odds feed under a
+// separate provider ("DraftKings - Live Odds"); the regular provider there holds the pre-game (tip-off) line.
+function oddsSide(it, home) {
+  const t = (home ? it?.homeTeamOdds : it?.awayTeamOdds) || {};
+  const sp = (o) => parseLine(o?.pointSpread?.american ?? o?.pointSpread?.alternateDisplayValue);
+  const ml = (o, fallback) => { const v = parseLine(o?.moneyLine?.american ?? fallback); return v === 0 ? 100 : v; };
+  return { spread: sp(t.current), open: sp(t.open), ml: ml(t.current, t.moneyLine), mlOpen: ml(t.open) };
+}
+export async function coreOdds(league, eventId) {
+  return cached(`core|${league}|${eventId}`, async () => {
+    const d = await getJSON(coreOddsUrl(league, eventId), true);
     const items = d.items || [];
-    const pick = items.find(i => /live/i.test(i.provider?.name || '')) || items.find(i => i.provider?.id === '100') || items[0];
-    if (!pick) return null;
-    const side = isHome ? pick.homeTeamOdds : pick.awayTeamOdds;
-    let line = parseLine(side?.current?.pointSpread?.american ?? side?.current?.pointSpread?.alternateDisplayValue);
-    if (line === null && typeof pick.spread === 'number') line = isHome ? pick.spread : -pick.spread;
-    return line === null ? null : { line, provider: pick.provider?.name || 'Sportsbook', providers: items.map(i => i.provider?.name) };
-  } catch { return null; }
+    const live = items.find(i => /live/i.test(i.provider?.name || ''));
+    const pre = items.find(i => i.provider?.id === '100') || items.find(i => !/live/i.test(i.provider?.name || ''));
+    const pack = it => it && { provider: it.provider?.name || 'Sportsbook', home: oddsSide(it, true), away: oddsSide(it, false) };
+    return { live: pack(live), pre: pack(pre) };
+  });
+}
+// Fill g.odds for a live game from the live feed: cur = live number, tip = pre-game (closing) number.
+export async function attachLiveOdds(league, g) {
+  const co = await coreOdds(league, g.id);
+  if (!co.live) return false;
+  const side = s => ({
+    cur: co.live[s].spread, open: co.pre?.[s].open ?? g.odds?.[s]?.open ?? null, tip: co.pre?.[s].spread ?? null,
+    ml: { cur: co.live[s].ml, open: co.pre?.[s].mlOpen ?? null, tip: co.pre?.[s].ml ?? null },
+  });
+  g.odds = { ...(g.odds || {}), provider: co.live.provider, live: true, home: side('home'), away: side('away') };
+  return true;
 }
 
 async function fetchInjuries(league, eventId, teamId) {
@@ -302,6 +328,7 @@ const saveWatches = (env, list) => env.WATCH.put('watches', JSON.stringify(list)
 // memo: changes made earlier in this same cron run (KV can be a moment behind its own writes,
 // and we must never send the same alert twice). pass: 0 for the first check of the minute.
 export async function runCheck(env, { force = false, memo = new Map(), pass = 0 } = {}) {
+  newPass();                                       // fresh feeds for every check (the recorder reuses them this pass)
   const log = [];
   const watches = (await loadWatches(env)).map(w => memo.has(w.id) ? { ...w, ...memo.get(w.id) } : w);
   const active = watches.filter(w => w.status !== 'done');
@@ -337,15 +364,13 @@ export async function runCheck(env, { force = false, memo = new Map(), pass = 0 
     }
     const isHome = g.home.id === w.teamId;
     const m = w.market || 'spread';
-    let line = pickLine(g, isHome, m);
-    let provider = g.odds?.provider || null;
-    // The scoreboard (refreshed every ~7s) is the main source. Once a minute, see whether ESPN also
-    // lists a dedicated live-odds provider; use it only if it exists (that feed is cached longer).
-    if (g.state === 'in' && pass === 0 && m === 'spread') {
-      const live = await liveLineFromCore(w.league, w.eventId, isHome);
-      if (live && /live/i.test(live.provider)) { line = live.line; provider = live.provider; }
+    // Live games: the scoreboard has no odds, so read the (cache-busted) live feed on every check.
+    if (g.state === 'in') {
+      try { await attachLiveOdds(w.league, g); } catch (e) { log.push(`${w.teamAbbr}: live feed error ${e.message}`); }
     }
-    if (line === null) { log.push(`${w.teamAbbr}: no line posted (often pulled during reviews/timeouts)`); continue; }
+    const line = pickLine(g, isHome, m);
+    const provider = g.odds?.provider || null;
+    if (line === null) { log.push(`${w.teamAbbr}: no line posted (books pull it during reviews/timeouts)`); continue; }
 
     if (w.openLine === null || w.openLine === undefined) {
       u.openLine = pickLine(g, isHome, m, 'open') ?? line;
@@ -353,7 +378,7 @@ export async function runCheck(env, { force = false, memo = new Map(), pass = 0 
     const isSwing = typeof w.swing === 'number';
     // Swing watch: at the first live check, lock in the tip-off line (last pre-game line seen) and set the target.
     if (isSwing && g.state === 'in' && (w.tipLine === null || w.tipLine === undefined)) {
-      u.tipLine = w.pregameLine ?? line;
+      u.tipLine = w.pregameLine ?? pickLine(g, isHome, m, 'tip') ?? line;
       u.target = fromSwing(u.tipLine, w.swing, m);
       log.push(`${w.teamAbbr}: tip-off line ${fmtVal(u.tipLine, m)} → target ${fmtVal(u.target, m)}`);
     }
@@ -399,8 +424,9 @@ export async function runCheck(env, { force = false, memo = new Map(), pass = 0 
 
 // Cron fires once a minute; during games keep re-checking every few seconds until just before the next run.
 export async function runMinute(env, sleep = ms => new Promise(r => setTimeout(r, ms))) {
-  const start = now(), memo = new Map(), rec = { books: {}, dirty: new Set() };
+  const start = now(), memo = new Map(), rec = { books: {}, dirty: new Set(), rr: 0 };
   let pass = 0, r;
+  setBudget(45);                                   // free plan: 50 outbound requests per run, keep a few spare
   do {
     r = await runCheck(env, { memo, pass });
     const recLive = await recordPass(env, rec).catch(e => { console.log('record failed', e.message); return false; });
@@ -412,6 +438,7 @@ export async function runMinute(env, sleep = ms => new Promise(r => setTimeout(r
   } while (true);
   // One KV write per recorded league-day per minute, only if something changed (stays inside free KV limits).
   for (const key of rec.dirty) await env.WATCH.put(key, JSON.stringify(rec.books[key]));
+  setBudget(Infinity);
   return pass;
 }
 
@@ -420,6 +447,7 @@ export async function runMinute(env, sleep = ms => new Promise(r => setTimeout(r
 // point = [time, period (0 = pre-game), clock seconds, home score, away score, home spread, home ML, away ML].
 // Used to measure how far real live lines move when a team falls behind (see worker/calibrate.py).
 const MAX_POINTS = 3000;
+const REC_LIVE_PER_PASS = 4;      // live games whose live line is fetched per pass (rotates; keeps inside the request budget)
 const etParts = t => Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric',
   month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false }).formatToParts(t).map(p => [p.type, p.value]));
 export const etDate = (t = now()) => { const p = etParts(t); return p.year + p.month + p.day; };
@@ -444,9 +472,18 @@ export async function recordPass(env, rec) {
       if (relevant.some(g => g.state !== 'post')) busy = true;
       if (!rec.books[key]) rec.books[key] = (await env.WATCH.get(key, 'json')) || { league: lg, date, games: {} };
       const book = rec.books[key];
+      // Live games need a separate live-feed request each; take a few per pass, rotating through them.
+      const liveGames = relevant.filter(g => g.state === 'in');
+      const pick = new Set();
+      for (let i = 0; i < Math.min(REC_LIVE_PER_PASS, liveGames.length); i++) pick.add(liveGames[(rec.rr + i) % liveGames.length].id);
+      rec.rr += REC_LIVE_PER_PASS;
       for (const g of relevant) {
         const e = book.games[g.id] ||= { name: g.shortName || g.name, home: g.home.abbr, away: g.away.abbr, start: g.start, points: [] };
         if (g.state === 'post') { e.final = [g.home.score, g.away.score]; rec.dirty.add(key); continue; }
+        if (g.state === 'in') {
+          if (!pick.has(g.id)) continue;                 // not this pass's turn
+          try { if (!(await attachLiveOdds(lg, g))) continue; } catch { continue; }
+        }
         const pt = [now(), g.state === 'in' ? g.period : 0, g.clockSec, g.home.score ?? 0, g.away.score ?? 0,
           g.odds?.home?.cur ?? null, g.odds?.home?.ml?.cur ?? null, g.odds?.away?.ml?.cur ?? null];
         const last = e.points[e.points.length - 1];
@@ -483,18 +520,20 @@ async function createWatch(env, body) {
   const isHome = g.home.id === String(teamId);
   if (!isHome && g.away.id !== String(teamId)) throw new Error('team not in that game');
   const me = isHome ? g.home : g.away, opp = isHome ? g.away : g.home;
+  if (g.state === 'in') { try { await attachLiveOdds(league, g); } catch { /* no live feed */ } }
   const cur = pickLine(g, isHome, market);
   const open = pickLine(g, isHome, market, 'open');
+  const tip = g.state === 'in' ? (pickLine(g, isHome, market, 'tip') ?? cur) : null;   // pre-game (closing) line
   const injuries = await fetchInjuries(league, g.id, me.id);
   const w = {
     id: crypto.randomUUID().slice(0, 8), league, date, eventId: g.id, start: g.start,
     teamId: me.id, teamAbbr: me.abbr, teamName: me.name, oppAbbr: opp.abbr, isHome, market, until,
     dir: swing !== null ? (swing < 0 ? 'down' : 'up') : (body.dir === 'down' ? 'down' : 'up'),
-    // swing watch set mid-game: the "tip-off" reference is the line right now
-    swing, tipLine: swing !== null && g.state === 'in' ? cur : null,
-    target: swing === null ? target : (g.state === 'in' && cur !== null ? fromSwing(cur, swing, market) : null),
+    // swing watch set mid-game: measured from the real tip-off line (from the odds feed)
+    swing, tipLine: swing !== null && g.state === 'in' ? tip : null,
+    target: swing === null ? target : (g.state === 'in' && tip !== null ? fromSwing(tip, swing, market) : null),
     repeat: !!repeat, status: 'armed', created: now(),
-    openLine: open ?? cur, baseLine: cur, pregameLine: g.state === 'pre' ? cur : (open ?? cur), lastLine: cur, lastLineAt: now(), provider: g.odds?.provider || null,
+    openLine: open ?? cur, baseLine: cur, pregameLine: g.state === 'pre' ? cur : (tip ?? open ?? cur), lastLine: cur, lastLineAt: now(), provider: g.odds?.provider || null,
     history: cur === null ? [] : [[now(), cur, me.score, opp.score, g.state === 'in' ? g.detail : g.state]],
     injuryBaseline: (injuries || []).filter(i => /out|doubt|question|day-to-day/i.test(i.status)),
   };
