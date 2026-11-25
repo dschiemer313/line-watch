@@ -195,6 +195,61 @@ export function simplifyEvent(e) {
   };
 }
 
+// ---------- The Odds API fallback (free tier) ----------
+// Official odds API that allows server requests. Free tier ≈ 500 credits/month, 1 credit per market per call,
+// one call covers every game in a league. Used only for live watched games when ESPN's feed is refused,
+// and spaced out (every OA_EVERY_MIN minutes, slower when the month's credits run low) so the quota lasts.
+const OA_SPORT = { nba: 'basketball_nba', ncaab: 'basketball_ncaab', nfl: 'americanfootball_nfl', ncaaf: 'americanfootball_ncaaf',
+  nhl: 'icehockey_nhl', mlb: 'baseball_mlb', wnba: 'basketball_wnba', mls: 'soccer_usa_mls', epl: 'soccer_epl' };
+const OA_EVERY_MIN = 2;
+const OA_MEM = new Map();
+const normName = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+export async function oddsApi(env, league, markets) {
+  if (!env.ODDS_API_KEY || !OA_SPORT[league]) return null;
+  const key = `oa:${league}`;
+  let st = OA_MEM.get(key) || (await env.WATCH.get(key, 'json'));
+  const left = st?.remaining ?? 500;
+  const every = left < 10 ? Infinity : left < 60 ? 10 : OA_EVERY_MIN;       // stretch the quota when it's low
+  const fresh = st && now() - st.at < every * 60000 && markets.split(',').every(x => (st.markets || '').split(',').includes(x));
+  if (fresh || left < 10) { if (st) OA_MEM.set(key, st); return st; }
+  if (BUDGET-- <= 0) return st;
+  const url = `https://api.the-odds-api.com/v4/sports/${OA_SPORT[league]}/odds?apiKey=${encodeURIComponent(env.ODDS_API_KEY)}`
+    + `&regions=us&bookmakers=draftkings&markets=${markets}&oddsFormat=american`;
+  try {
+    const r = await fetch(url);
+    const remaining = Number(r.headers.get('x-requests-remaining'));
+    if (!r.ok) {
+      st = { ...(st || {}), at: now(), markets, error: `${r.status}`, remaining: Number.isFinite(remaining) ? remaining : st?.remaining ?? null };
+    } else {
+      const events = await r.json();
+      st = { at: now(), markets, error: null, remaining: Number.isFinite(remaining) ? remaining : null,
+        events: events.map(e => {
+          const dk = (e.bookmakers || [])[0];
+          const mk = k => (dk?.markets || []).find(x => x.key === k)?.outcomes || [];
+          return { home: e.home_team, away: e.away_team, start: e.commence_time, updated: dk?.last_update || null,
+            spreads: Object.fromEntries(mk('spreads').map(o => [normName(o.name), o.point])),
+            ml: Object.fromEntries(mk('h2h').map(o => [normName(o.name), o.price])) };
+        }) };
+    }
+  } catch (e) { st = { ...(st || {}), at: now(), markets, error: e.message }; }
+  OA_MEM.set(key, st);
+  await env.WATCH.put(key, JSON.stringify(st));
+  return st;
+}
+// Fill g.odds from an Odds API snapshot (matched by team names). Returns false if the game isn't in it.
+export function attachOddsApi(st, g) {
+  const hn = normName(g.home.name), an = normName(g.away.name);
+  const same = (a, b) => a === b || a.includes(b) || b.includes(a);
+  const e = (st?.events || []).find(x => same(normName(x.home), hn) && same(normName(x.away), an));
+  if (!e) return false;
+  const side = (t) => { const k = normName(t); const s = e.spreads[k] ?? null; const m = e.ml[k] ?? null;
+    return { cur: s, open: null, tip: null, ml: { cur: m === 0 ? 100 : m, open: null, tip: null } }; };
+  g.odds = { ...(g.odds || {}), provider: 'DraftKings via The Odds API', live: true, viaOddsApi: true,
+    updated: e.updated, home: side(e.home), away: side(e.away) };
+  return g.odds.home.cur !== null || g.odds.home.ml.cur !== null;
+}
+
 // The watched team's number for a market: which = 'cur' or 'open'.
 export function pickLine(g, isHome, market, which = 'cur') {   // which: 'cur' | 'open' | 'tip'
   const side = g.odds?.[isHome ? 'home' : 'away'];
@@ -225,9 +280,16 @@ export async function coreOdds(league, eventId) {
     return { live: pack(live), pre: pack(pre) };
   });
 }
+// ESPN refuses its live-odds feed to Cloudflare's servers (403). Once seen in a run, stop asking (saves requests).
+let ESPN_BLOCKED = false;
+export function resetEspnBlocked() { ESPN_BLOCKED = false; }
+
 // Fill g.odds for a live game from the live feed: cur = live number, tip = pre-game (closing) number.
 export async function attachLiveOdds(league, g) {
-  const co = await coreOdds(league, g.id);
+  if (ESPN_BLOCKED) return false;
+  let co;
+  try { co = await coreOdds(league, g.id); }
+  catch (e) { if (/\b403\b/.test(e.message)) ESPN_BLOCKED = true; throw e; }
   if (!co.live) return false;
   const side = s => ({
     cur: co.live[s].spread, open: co.pre?.[s].open ?? g.odds?.[s]?.open ?? null, tip: co.pre?.[s].spread ?? null,
@@ -367,9 +429,16 @@ export async function runCheck(env, { force = false, memo = new Map(), pass = 0 
     }
     const isHome = g.home.id === w.teamId;
     const m = w.market || 'spread';
-    // Live games: the scoreboard has no odds, so read the (cache-busted) live feed on every check.
+    // Live games: the scoreboard has no odds. Try ESPN's live feed; if it's refused, use The Odds API (spaced out).
     if (g.state === 'in') {
-      try { await attachLiveOdds(w.league, g); } catch (e) { log.push(`${w.teamAbbr}: live feed error ${e.message}`); }
+      let ok = false;
+      try { ok = await attachLiveOdds(w.league, g); } catch (e) { if (pass === 0) log.push(`${w.teamAbbr}: ESPN live feed ${e.message.split(' ')[0]}`); }
+      if (!ok) {
+        const mk = active.some(x => x.league === w.league && x.market === 'ml') ? 'spreads,h2h' : 'spreads';
+        const st = await oddsApi(env, w.league, mk);
+        if (st && attachOddsApi(st, g)) ok = true;
+        else if (pass === 0) log.push(`${w.teamAbbr}: ${env.ODDS_API_KEY ? `Odds API ${st?.error ? 'error ' + st.error : 'has no line'}` : 'no ODDS_API_KEY set'}`);
+      }
     }
     const line = pickLine(g, isHome, m);
     const provider = g.odds?.provider || null;
@@ -428,6 +497,7 @@ export async function runCheck(env, { force = false, memo = new Map(), pass = 0 
 // Cron fires once a minute; during games keep re-checking every few seconds until just before the next run.
 export async function runMinute(env, sleep = ms => new Promise(r => setTimeout(r, ms))) {
   const start = now(), memo = new Map(), rec = { books: {}, dirty: new Set(), rr: 0 };
+  resetEspnBlocked();                              // re-test ESPN once per minute in case it lets us back in
   let pass = 0, r, every = FAST_EVERY_SEC * 1000, next = start;
   setBudget(RUN_BUDGET);
   do {
@@ -539,7 +609,9 @@ async function createWatch(env, body) {
   if (g.state === 'in') { try { await attachLiveOdds(league, g); } catch { /* no live feed */ } }
   const cur = pickLine(g, isHome, market);
   const open = pickLine(g, isHome, market, 'open');
-  const tip = g.state === 'in' ? (pickLine(g, isHome, market, 'tip') ?? cur) : null;   // pre-game (closing) line
+  // pre-game (closing) line; the phone sends what it sees when ESPN won't answer the watcher
+  const num = v => typeof v === 'number' && Number.isFinite(v) ? v : null;
+  const tip = g.state === 'in' ? (pickLine(g, isHome, market, 'tip') ?? num(body.tipLine) ?? cur ?? num(body.liveLine)) : null;
   const injuries = await fetchInjuries(league, g.id, me.id);
   const w = {
     id: crypto.randomUUID().slice(0, 8), league, date, eventId: g.id, start: g.start,
@@ -572,7 +644,38 @@ export default {
         return json(await fetchGames(league, url.searchParams.get('date')));
       }
       if (p === '/api/watches' && req.method === 'GET') {
-        return json({ watches: await loadWatches(env), heartbeat: await env.WATCH.get('heartbeat', 'json') });
+        const oa = {};
+        for (const lg of Object.keys(OA_SPORT)) {
+          const st = OA_MEM.get(`oa:${lg}`) || (await env.WATCH.get(`oa:${lg}`, 'json'));
+          if (st) oa[lg] = { at: st.at, remaining: st.remaining, error: st.error };
+        }
+        return json({ watches: await loadWatches(env), heartbeat: await env.WATCH.get('heartbeat', 'json'),
+          oddsApi: { configured: !!env.ODDS_API_KEY, leagues: oa } });
+      }
+      // The phone (app open) saw a watch hit on ESPN's live feed: verify, send the push, mark it fired.
+      if (p === '/api/fire' && req.method === 'POST') {
+        const body = await req.json();
+        const line = typeof body.line === 'number' ? body.line : null;
+        const list = await loadWatches(env);
+        const w = list.find(x => x.id === body.id);
+        if (!w) return json({ error: 'not found' }, 404);
+        if (w.status !== 'armed' || line === null) return json({ ok: false, status: w.status });
+        const m = w.market || 'spread';
+        if (typeof w.swing === 'number' && w.tipLine == null && typeof body.tipLine === 'number') {
+          w.tipLine = body.tipLine; w.target = fromSwing(w.tipLine, w.swing, m);
+        }
+        if (w.target == null) return json({ ok: false, reason: 'no target yet' });
+        const g = (await fetchGames(w.league, w.date, true)).find(x => x.id === w.eventId);
+        if (g && !inWindow(w, g)) return json({ ok: false, reason: 'past the cutoff' });
+        const ev = evaluate(w, g || { state: 'in', home: {}, away: {} }, line);
+        if (!ev.met) return json({ ok: false, reason: 'not at target' });
+        const injuries = g ? await fetchInjuries(w.league, w.eventId, w.teamId) : null;
+        const alert = g ? buildAlert(w, g, line, 'DraftKings (seen by your phone)', injuries, ev.warnings)
+          : { title: `${w.teamAbbr} ${fmtVal(line, m)}: target hit`, message: 'Seen by your phone.', click: 'https://sportsbook.draftkings.com/' };
+        await notify(env, alert);
+        Object.assign(w, { status: 'fired', firedAt: now(), firedLine: line, lastAlert: alert, lastLine: line, lastLineAt: now() });
+        await saveWatches(env, list);
+        return json({ ok: true, alert });
       }
       if (p === '/api/watches' && req.method === 'POST') return json(await createWatch(env, await req.json()));
       const m = p.match(/^\/api\/watches\/([\w-]+)$/);

@@ -141,25 +141,112 @@ async function loadGames() {
 // ESPN removes odds from the scoreboard once a game starts. The live line is in its odds feed under
 // "DraftKings - Live Odds" (the regular DraftKings entry there = the tip-off line). The feed is cached by
 // ESPN for minutes, so add a throwaway parameter to get the current number.
-async function attachLiveOdds(L, g) {
+// Returns { live, pre } with { home: {spread, ml}, away: {...} } each, or null. Works from the phone.
+async function fetchCoreOdds(L, id) {
   try {
     const [sport, lg] = L.path.split('/');
-    const r = await fetch(`https://sports.core.api.espn.com/v2/sports/${sport}/leagues/${lg}/events/${g.id}/competitions/${g.id}/odds?_=${Date.now()}`);
-    if (!r.ok) return;
+    const r = await fetch(`https://sports.core.api.espn.com/v2/sports/${sport}/leagues/${lg}/events/${id}/competitions/${id}/odds?_=${Date.now()}`);
+    if (!r.ok) return null;
     const items = (await r.json()).items || [];
     const live = items.find(i => /live/i.test(i.provider?.name || ''));
     const pre = items.find(i => i.provider?.id === '100') || items.find(i => !/live/i.test(i.provider?.name || ''));
-    if (!live) { g.odds = { live: true, none: true, home: {}, away: {} }; return; }
     const f = (it, s) => {
       const t = (s === 'home' ? it?.homeTeamOdds : it?.awayTeamOdds) || {};
       const ml = parseLine(t.current?.moneyLine?.american ?? t.moneyLine);
       return { spread: parseLine(t.current?.pointSpread?.american), ml: ml === 0 ? 100 : ml };
     };
-    const side = s => ({ cur: f(live, s).spread, tip: pre ? f(pre, s).spread : null, open: null,
-      ml: { cur: f(live, s).ml, tip: pre ? f(pre, s).ml : null, open: null } });
-    g.odds = { provider: live.provider.name, live: true, home: side('home'), away: side('away') };
-  } catch { /* leave as "no line" */ }
+    const pack = it => it && { provider: it.provider?.name, home: f(it, 'home'), away: f(it, 'away') };
+    return { live: pack(live), pre: pack(pre) };
+  } catch { return null; }
 }
+async function attachLiveOdds(L, g) {
+  const o = await fetchCoreOdds(L, g.id);
+  if (!o) return;
+  if (!o.live) { g.odds = { live: true, none: true, home: {}, away: {} }; return; }
+  const side = s => ({ cur: o.live[s].spread, tip: o.pre ? o.pre[s].spread : null, open: null,
+    ml: { cur: o.live[s].ml, tip: o.pre ? o.pre[s].ml : null, open: null } });
+  g.odds = { provider: o.live.provider, live: true, home: side('home'), away: side('away') };
+}
+
+// ---------- phone-side live checking (while Line Watch is open) ----------
+// ESPN won't give the cloud watcher its live-odds feed, but it answers this phone. While the app is open,
+// check every armed watch whose game has started, every 4 s. On a hit: alert here (screen + sound) and
+// ask the watcher to send the push so the Apple Watch / lock screen gets it too.
+const PHONE_EVERY_MS = 4000;
+S.phone = { fired: new Set(), live: {}, checking: 0, lastAt: 0 };
+function liveWatches() {
+  const t = Date.now();
+  return S.watches.filter(w => w.status === 'armed' && Date.parse(w.start) <= t + 60000 && t - Date.parse(w.start) < 5 * 3600e3);
+}
+async function phoneCheck() {
+  if (!configured() || document.visibilityState !== 'visible') return;
+  const ws = liveWatches();
+  S.phone.checking = ws.length;
+  if (!ws.length) { releaseWake(); return; }
+  keepAwake();
+  const byGame = {};
+  for (const w of ws) (byGame[w.league + '|' + w.eventId] ||= []).push(w);
+  await Promise.all(Object.entries(byGame).map(async ([k, list]) => {
+    const [lg, id] = k.split('|');
+    const o = await fetchCoreOdds(LEAGUES[lg], id);
+    if (!o?.live) return;                                    // not live yet, or DraftKings has pulled the line
+    for (const w of list) {
+      const s = w.isHome ? 'home' : 'away', m = w.market || 'spread';
+      const line = m === 'ml' ? o.live[s].ml : o.live[s].spread;
+      if (line === null || line === undefined) continue;
+      const tip = w.tipLine ?? (o.pre ? (m === 'ml' ? o.pre[s].ml : o.pre[s].spread) : null);
+      const target = w.target ?? (typeof w.swing === 'number' && tip !== null ? fromSwing(tip, w.swing, m) : null);
+      S.phone.live[w.id] = { line, tip, target, at: Date.now() };
+      if (target === null) continue;
+      const met = w.dir === 'down' ? scale(line, m) <= scale(target, m) : scale(line, m) >= scale(target, m);
+      if (met && !S.phone.fired.has(w.id)) {
+        S.phone.fired.add(w.id);
+        showHit(w, line, tip, target, m);
+        api('/api/fire', { method: 'POST', body: JSON.stringify({ id: w.id, line, tipLine: tip }) })
+          .then(() => loadWatches()).catch(() => {});
+      }
+    }
+  }));
+  S.phone.lastAt = Date.now();
+  if (S.tab === 'watching') render();
+}
+
+// Full-screen alert + sound while the app is open.
+let AUDIO = null;
+function unlockAudio() {           // iPhone only allows sound after a tap; any tap in the app unlocks it
+  try { AUDIO = AUDIO || new (window.AudioContext || window.webkitAudioContext)(); AUDIO.resume?.(); } catch { /* no audio */ }
+}
+function beep() {
+  if (!AUDIO) return;
+  [0, 0.35, 0.7, 1.4, 1.75, 2.1].forEach(t => {
+    const o = AUDIO.createOscillator(), g = AUDIO.createGain();
+    o.frequency.value = 880; g.gain.value = 0.25;
+    o.connect(g); g.connect(AUDIO.destination);
+    o.start(AUDIO.currentTime + t); o.stop(AUDIO.currentTime + t + 0.22);
+  });
+}
+function showHit(w, line, tip, target, m) {
+  const sw = typeof w.swing === 'number' ? `moved ${signed(w.swing, m)}${m === 'ml' ? '' : ' pts'} from tip-off ${fmtVal(tip, m)}` : `target ${fmtVal(target, m)}`;
+  const el = document.createElement('div');
+  el.className = 'hit';
+  el.innerHTML = `<div class="hit-card"><div class="hit-tag">🚨 LINE ALERT</div>
+    <div class="hit-line">${esc(w.teamAbbr)} ${fmtVal(line, m)}${m === 'ml' ? ' ML' : ''}</div>
+    <div class="hit-sub">${esc(w.teamAbbr)} ${w.isHome ? 'vs' : '@'} ${esc(w.oppAbbr)} · ${esc(sw)}</div>
+    <a class="btn" href="https://sportsbook.draftkings.com/" target="_blank" rel="noopener">Open DraftKings</a>
+    <button class="btn secondary" data-hitclose>Dismiss</button>
+    <div class="note" style="margin-top:8px">Confirm the line in DraftKings before betting.</div></div>`;
+  document.body.appendChild(el);
+  beep();
+  try { navigator.vibrate?.([400, 150, 400, 150, 400]); } catch { /* iPhone ignores this */ }
+}
+
+// Keep the screen awake while the phone is checking live games (otherwise iOS pauses the app).
+let WAKE = null;
+async function keepAwake() {
+  if (WAKE || !('wakeLock' in navigator)) return;
+  try { WAKE = await navigator.wakeLock.request('screen'); WAKE.addEventListener('release', () => { WAKE = null; }); } catch { /* not allowed */ }
+}
+function releaseWake() { try { WAKE?.release(); } catch { /* ignore */ } WAKE = null; }
 
 // ---------- Worker API ----------
 const configured = () => !!(S.cfg.url && S.cfg.key);
@@ -244,8 +331,10 @@ function renderWatching() {
   if (S.watchErr) return `<div class="card"><span class="bad">Can't reach your watcher:</span> ${esc(S.watchErr)}<div class="note">Check the URL and key on the Setup tab.</div></div>`;
   const list = [...S.watches].sort((a, b) => (a.status === 'done') - (b.status === 'done') || a.start.localeCompare(b.start));
   if (!list.length) return `<div class="empty"><div class="big">🔔</div>Nothing yet. Go to <a href="#" data-go="games">Games</a>, tap a game, and set a target line.</div>`;
-  const hb = S.heartbeat ? `<div class="note" style="margin:0 4px 10px">Watcher last checked in ${ago(S.heartbeat.at)}.</div>` : '';
-  return hb + list.map(watchCard).join('');
+  const n = liveWatches().length;
+  const phone = n ? `<div class="card phone-on"><b>📱 This phone is checking ${n} live alert${n === 1 ? '' : 's'} every 4 seconds.</b>
+      <div class="note">Keep Line Watch open on this screen during the game (the screen stays on). Alerts show here with a sound, and go to your Apple Watch / lock screen too. Tap anywhere once so the sound can play.</div></div>` : '';
+  return phone + list.map(watchCard).join('');
 }
 
 function watchCard(w) {
@@ -254,6 +343,8 @@ function watchCard(w) {
     ? `<div class="alert-box"><b>${esc(w.lastAlert.title)}</b>\n${esc(w.lastAlert.message)}</div>` : '';
   const fin = w.status === 'done' && w.final ? ` · Final ${esc(w.final)}` : '';
   const m = w.market || 'spread';
+  const pl = S.phone.live[w.id];                       // what this phone saw on ESPN's live feed just now
+  if (pl && w.status === 'armed') w = { ...w, lastLine: pl.line, tipLine: w.tipLine ?? pl.tip, target: w.target ?? pl.target };
   return `<div class="card watch">
     <div class="watch-head"><div><div class="t">${esc(w.teamAbbr)} ${w.isHome ? 'vs' : '@'} ${esc(w.oppAbbr)}</div>
       <div class="s">${esc(LEAGUES[w.league]?.label || '')} · ${m === 'ml' ? 'Moneyline' : 'Spread'} · ${when}${fin}</div>
@@ -268,7 +359,7 @@ function watchCard(w) {
         ${typeof w.swing === 'number' ? `<div class="k" style="text-transform:none">${signed(w.swing, m)}${m === 'ml' ? '' : ' pts'} from tip${w.tipLine != null ? ` (${fmtVal(w.tipLine, m)})` : ''}</div>` : ''}</div>
     </div>
     ${spark(w)}
-    <div class="note">${w.lastLineAt ? 'Line last moved ' + ago(w.lastLineAt) : ''}${w.repeat ? ' · alerts again if it bounces back' : ' · alerts once'}</div>
+    <div class="note">${pl && w.status === 'armed' ? `Live line checked ${Math.max(0, Math.round((Date.now() - pl.at) / 1000))}s ago by this phone` : w.lastLineAt ? 'Line last moved ' + ago(w.lastLineAt) : ''}${w.repeat ? ' · alerts again if it bounces back' : ' · alerts once'}</div>
     ${alert}
     <div class="actions">
       ${w.status === 'fired' ? `<button class="mini" data-rearm="${w.id}">Re-arm</button>` : ''}
@@ -544,9 +635,11 @@ function drawEditSheet() {
 
 // ---------- events ----------
 document.addEventListener('click', async e => {
+  unlockAudio();
   const t = e.target.closest('button, [data-game], [data-go]');
   if (!t) return;
   const d = t.dataset;
+  if (t.hasAttribute('data-hitclose')) { t.closest('.hit')?.remove(); return; }
   if (d.tab) { S.tab = d.tab; render(); if (S.tab === 'watching') loadWatches(); if (S.tab === 'settings') loadRecord(); window.scrollTo(0, 0); return; }
   if (t.id === 'rec-save') {
     const leagues = [...document.querySelectorAll('[data-rec]')].filter(x => x.checked).map(x => x.dataset.rec);
@@ -577,6 +670,9 @@ document.addEventListener('click', async e => {
     if (mode === 'swing' && (!Number.isFinite(swing) || swing === 0)) { toast('Type a swing first, like +9.5 or -2'); return; }
     const body = { league: S.league, date: ymd(dayDate(S.day)), eventId: g.id, teamId: g[side].id, repeat, market, until };
     if (mode === 'swing') body.swing = swing; else { body.target = target; body.dir = dirOf(target, curLine(), market); }
+    if (g.state === 'in') {                               // the watcher can't see live lines; send what this phone sees
+      body.tipLine = lineOf(g.odds?.[side], market, 'tip'); body.liveLine = curLine();
+    }
     t.disabled = true; t.textContent = 'Saving…';
     try {
       await api('/api/watches', { method: 'POST', body: JSON.stringify(body) });
@@ -632,6 +728,7 @@ document.addEventListener('input', e => { if (e.target.id === 'swing') onSwingIn
 
 // Keep it fresh while the app is open.
 setInterval(() => { if (document.visibilityState === 'visible' && !sheet.state) { loadGames(); loadWatches(); } }, 30000);
+setInterval(() => phoneCheck().catch(() => {}), PHONE_EVERY_MS);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { loadGames(); loadWatches(); } });
 
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});

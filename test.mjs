@@ -203,6 +203,53 @@ for (const [swing, path, wantFireAt] of [
   liveFeed.odds = null; liveFeed.tipHome = null;
 }
 
+// --- tonight's real failure: ESPN's live feed returns 403 to the watcher → fall back to The Odds API ---
+{
+  kv.clear(); pushes.length = 0;
+  env.ODDS_API_KEY = 'test-oa-key';
+  let oaCalls = 0, oaHomeLine = -9;
+  const prev = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    url = String(url);
+    if (url.includes('sports.core.api.espn.com')) return new Response('Forbidden', { status: 403 });
+    if (url.includes('api.the-odds-api.com')) {
+      oaCalls++;
+      const ev0 = [{ home_team: homeC.team.displayName, away_team: awayC.team.displayName, commence_time: ev.date,
+        bookmakers: [{ key: 'draftkings', last_update: new Date().toISOString(), markets: [{ key: 'spreads', outcomes: [
+          { name: homeC.team.displayName, price: -110, point: oaHomeLine }, { name: awayC.team.displayName, price: -110, point: -oaHomeLine }] }] }] }];
+      return new Response(JSON.stringify(ev0), { headers: { 'x-requests-remaining': String(500 - oaCalls), 'x-requests-used': String(oaCalls) } });
+    }
+    return prev(url, opts);
+  };
+  setGame({ state: 'pre', homeScore: 0, awayScore: 0, homeLine: -10, detail: '7:30 PM' });
+  await call('POST', '/api/watches', { league: 'nba', date, eventId: ev.id, teamId: homeC.team.id, swing: 6 });
+  setGame({ state: 'in', homeScore: 30, awayScore: 36, homeLine: -10 }); comp.status.period = 2; comp.status.clock = 300;
+  const saved = comp.odds; delete comp.odds;
+  const a = await runCheck(env, { force: true });
+  oaHomeLine = -3.5;                                     // line moves, but the cached Odds API snapshot is < 2 min old
+  const b = await runCheck(env, { force: true });
+  const rn2 = Date.now; const t2 = Date.now() + 3 * 60000; Date.now = () => t2;  // 3 minutes later → fetch again
+  const c = await runCheck(env, { force: true });
+  Date.now = rn2; comp.odds = saved; globalThis.fetch = prev;
+  console.log(`\nESPN 403 → The Odds API fallback:\n  ${a.log.join(' | ')}\n  ${b.log.join(' | ')}  (snapshot reused)\n  ${c.log.join(' | ')}`);
+  assert.equal(oaCalls, 2, 'Odds API called once, then again only after 2+ minutes');
+  assert.equal(pushes.length, 1); console.log('  alert:', pushes[0].title, `| Odds API credits left: ${JSON.parse(kv.get('oa:nba')).remaining}`);
+  delete env.ODDS_API_KEY;
+}
+
+// --- phone-detected hit: POST /api/fire ---
+{
+  kv.clear(); pushes.length = 0;
+  setGame({ state: 'pre', homeScore: 0, awayScore: 0, homeLine: -10, detail: '7:30 PM' });
+  const fw = await call('POST', '/api/watches', { league: 'nba', date, eventId: ev.id, teamId: homeC.team.id, swing: 9.5 });
+  setGame({ state: 'in', homeScore: 40, awayScore: 50, homeLine: -1 }); comp.status.period = 2; comp.status.clock = 200;
+  const notYet = await call('POST', '/api/fire', { id: fw.id, line: -3, tipLine: -10 });
+  const hit = await call('POST', '/api/fire', { id: fw.id, line: -0.5, tipLine: -10 });
+  const again = await call('POST', '/api/fire', { id: fw.id, line: 0, tipLine: -10 });
+  console.log(`\nPhone-detected hits: -3 → ${notYet.reason}; -0.5 → ${hit.ok ? 'ALERT: ' + hit.alert.title : 'no'}; again → ${again.status}`);
+  assert.equal(notYet.ok, false); assert.equal(hit.ok, true); assert.equal(again.ok, false); assert.equal(pushes.length, 1);
+}
+
 // --- "only alert until" cutoffs ---
 const at = (league, until, game) => inWindow({ league, until }, { state: 'in', ...game });
 const q2 = { p: 2, left: 0 }, q2_2min = { p: 2, left: 120 };
