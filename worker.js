@@ -93,7 +93,9 @@ export const fromSwing = (base, swing, market) => unscale(scale(base, market) + 
 export const fmtVal = (x, market) => market !== 'ml' ? fmtLine(x)
   : (x === null || x === undefined) ? '—' : (x > 0 ? '+' + x : String(x));
 
-const FAST_EVERY_SEC = 8;         // during games, re-check this often inside each 1-minute cron run
+const FAST_EVERY_SEC = 4;         // during games, re-check this often inside each 1-minute cron run (slows itself
+                                  // down automatically if many watched games would exceed the free plan's request limit)
+const RUN_BUDGET = 46;            // free plan: 50 outbound requests per run, keep a few spare for the push alert
 const FAST_WINDOW_SEC = 50;       // stop before the next cron run starts
 const PREGAME_LEAD_MIN = 30;      // fast checks from 30 min before start
 const PREGAME_EVERY_MIN = 15;     // before that, check every 15 min (catches injury-news moves)
@@ -138,13 +140,14 @@ let BUDGET = Infinity;
 const PASS_CACHE = new Map();
 export function newPass() { PASS_CACHE.clear(); }
 export function setBudget(n) { BUDGET = n; }
+export const budgetLeft = () => BUDGET;
 const cached = (key, fn) => { if (!PASS_CACHE.has(key)) PASS_CACHE.set(key, fn()); return PASS_CACHE.get(key); };
 
 async function getJSON(url, fresh = false) {
   if (BUDGET-- <= 0) throw new Error('request budget for this minute used up');
   // fresh: add a throwaway param so neither Cloudflare nor ESPN's CDN hands back an older copy
   // (ESPN caches the live-odds feed for up to 4 minutes otherwise)
-  if (fresh) url += (url.includes('?') ? '&' : '?') + '_=' + Math.floor(Date.now() / 4000);
+  if (fresh) url += (url.includes('?') ? '&' : '?') + '_=' + Math.floor(Date.now() / 2000);
   const r = await fetch(url, { headers: { 'user-agent': 'line-watch/1.0' }, cache: 'no-store' });
   if (!r.ok) throw new Error(`${r.status} ${url}`);
   return r.json();
@@ -425,14 +428,24 @@ export async function runCheck(env, { force = false, memo = new Map(), pass = 0 
 // Cron fires once a minute; during games keep re-checking every few seconds until just before the next run.
 export async function runMinute(env, sleep = ms => new Promise(r => setTimeout(r, ms))) {
   const start = now(), memo = new Map(), rec = { books: {}, dirty: new Set(), rr: 0 };
-  let pass = 0, r;
-  setBudget(45);                                   // free plan: 50 outbound requests per run, keep a few spare
+  let pass = 0, r, every = FAST_EVERY_SEC * 1000, next = start;
+  setBudget(RUN_BUDGET);
   do {
+    const before = budgetLeft();
     r = await runCheck(env, { memo, pass });
+    const alertCost = before - budgetLeft();         // requests one alert check needs (scoreboard + live feeds)
+    // Pace so the alert checks alone can run all minute inside the budget: 4 s with 1-2 live watches, slower with more.
+    if (pass === 0 && alertCost > 0) {
+      const passesAffordable = Math.max(1, Math.floor(RUN_BUDGET / alertCost));
+      every = Math.max(FAST_EVERY_SEC * 1000, Math.ceil(FAST_WINDOW_SEC * 1000 / passesAffordable));
+    }
+    // The recorder only gets requests the remaining alert checks this minute won't need.
+    rec.reserve = alertCost * Math.max(0, Math.ceil((start + FAST_WINDOW_SEC * 1000 - now()) / every) - 1);
     const recLive = await recordPass(env, rec).catch(e => { console.log('record failed', e.message); return false; });
     pass++;
     if (!r.fast && !recLive) break;
-    const wait = start + pass * FAST_EVERY_SEC * 1000 - now();
+    next += every;
+    const wait = next - now();
     if (now() + Math.max(wait, 0) > start + FAST_WINDOW_SEC * 1000) break;
     if (wait > 0) await sleep(wait);
   } while (true);
@@ -462,6 +475,8 @@ export async function recordPass(env, rec) {
     if (Number(etParts(now()).hour) < 4) dates.push(etDate(now() - 86400000));   // late games past midnight ET
     for (const date of dates) {
       const key = recKey(lg, date);
+      const spare = () => budgetLeft() - 1 >= (rec.reserve || 0);
+      if (!PASS_CACHE.has(`sb|${lg}|${date}`) && !spare()) continue;   // alerts come first
       let games;
       try { games = await fetchGames(lg, date, true); } catch { continue; }
       const book0 = rec.books[key];
@@ -482,6 +497,7 @@ export async function recordPass(env, rec) {
         if (g.state === 'post') { e.final = [g.home.score, g.away.score]; rec.dirty.add(key); continue; }
         if (g.state === 'in') {
           if (!pick.has(g.id)) continue;                 // not this pass's turn
+          if (!PASS_CACHE.has(`core|${lg}|${g.id}`) && !spare()) continue;
           try { if (!(await attachLiveOdds(lg, g))) continue; } catch { continue; }
         }
         const pt = [now(), g.state === 'in' ? g.period : 0, g.clockSec, g.home.score ?? 0, g.away.score ?? 0,

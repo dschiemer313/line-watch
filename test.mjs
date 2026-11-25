@@ -140,7 +140,7 @@ globalThis.fetch = async (url, opts) => {
 const passes = await runMinute(env, async ms => { clock += ms; });
 Date.now = realNow; globalThis.fetch = prevFetch;
 console.log(`\nFast loop: ${passes} checks in one minute (every ${Math.round(50 / (passes - 1))}s-ish); alert on check #4 of ${fetches}; pushes sent: ${pushes.length}`);
-assert.ok(passes >= 6, 'should check about every 8s');
+assert.ok(passes >= 12, 'should check about every 4s');
 assert.equal(pushes.length, 1, 'exactly one alert even though the line stayed at/through target for several checks');
 
 // Moneyline watch end-to-end on the real game's real moneyline data
